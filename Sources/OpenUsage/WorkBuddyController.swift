@@ -2,13 +2,35 @@ import AppKit
 import Foundation
 
 struct WorkBuddyController {
-    static let bundleIdentifier = "com.workbuddy.workbuddy"
+    // WorkBuddy 5.4+ 更换为腾讯签名 bundle ID；5.3.x 及更早版本保留旧 ID 兼容
+    // 候选顺序即优先级：新版在前，旧版兜底
+    static let bundleIdentifiers = [
+        "com.tencent.workbuddy.mac",
+        "com.workbuddy.workbuddy"
+    ]
     private static let gracefulTerminationTimeout: TimeInterval = 5
     private static let forcedTerminationTimeout: TimeInterval = 3
     private static let terminationPollInterval: UInt64 = 150_000_000
 
     var applicationURL: URL? {
-        NSWorkspace.shared.urlForApplication(withBundleIdentifier: Self.bundleIdentifier)
+        Self.resolveApplicationURL(
+            identifiers: Self.bundleIdentifiers
+        ) { identifier in
+            NSWorkspace.shared.urlForApplication(withBundleIdentifier: identifier)
+        }
+    }
+
+    // 按候选顺序解析第一个命中的安装路径；resolver 可注入以便离线测试
+    static func resolveApplicationURL(
+        identifiers: [String],
+        resolver: (String) -> URL?
+    ) -> URL? {
+        for identifier in identifiers {
+            if let url = resolver(identifier) {
+                return url
+            }
+        }
+        return nil
     }
 
     var cliURL: URL? {
@@ -194,9 +216,13 @@ struct WorkBuddyController {
 
     @MainActor
     private func runningApplications() -> [NSRunningApplication] {
-        NSRunningApplication.runningApplications(
-            withBundleIdentifier: Self.bundleIdentifier
-        )
+        // 汇总全部候选 bundle ID 的运行实例，并按进程号去重（同一实现已在 TraeSupport 验证）
+        var seen = Set<pid_t>()
+        return Self.bundleIdentifiers.flatMap {
+            NSRunningApplication.runningApplications(withBundleIdentifier: $0)
+        }.filter {
+            seen.insert($0.processIdentifier).inserted
+        }
     }
 
     @MainActor
