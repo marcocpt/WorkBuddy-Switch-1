@@ -441,6 +441,51 @@ enum OpenUsageSelfTest {
             "terminal WorkBuddy resume is detected before migration"
         )
 
+        // WorkBuddy 5.4+ 起用新 bundle ID，旧 ID 保留兜底；候选顺序即优先级
+        try expect(
+            WorkBuddyController.bundleIdentifiers
+                == ["com.tencent.workbuddy.mac", "com.workbuddy.workbuddy"],
+            "workbuddy bundle identifier candidates keep new build first"
+        )
+        try expect(
+            WorkBuddyController.resolveApplicationURL(
+                identifiers: WorkBuddyController.bundleIdentifiers
+            ) { identifier in
+                identifier == "com.tencent.workbuddy.mac"
+                    ? URL(fileURLWithPath: "/Applications/WorkBuddy.app")
+                    : nil
+            }?.path == "/Applications/WorkBuddy.app",
+            "workbuddy discovery resolves the new bundle id"
+        )
+        try expect(
+            WorkBuddyController.resolveApplicationURL(
+                identifiers: WorkBuddyController.bundleIdentifiers
+            ) { identifier in
+                identifier == "com.workbuddy.workbuddy"
+                    ? URL(fileURLWithPath: "/Applications/WorkBuddy Legacy.app")
+                    : nil
+            }?.path == "/Applications/WorkBuddy Legacy.app",
+            "workbuddy discovery falls back to the legacy bundle id"
+        )
+        try expect(
+            WorkBuddyController.resolveApplicationURL(
+                identifiers: WorkBuddyController.bundleIdentifiers
+            ) { identifier in
+                URL(
+                    fileURLWithPath: identifier == "com.tencent.workbuddy.mac"
+                        ? "/Applications/WorkBuddy.app"
+                        : "/Applications/WorkBuddy Legacy.app"
+                )
+            }?.path == "/Applications/WorkBuddy.app",
+            "workbuddy discovery prefers the new build when both exist"
+        )
+        try expect(
+            WorkBuddyController.resolveApplicationURL(
+                identifiers: WorkBuddyController.bundleIdentifiers
+            ) { _ in nil } == nil,
+            "workbuddy discovery returns nil when no candidate is installed"
+        )
+
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("openusage-selftest-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

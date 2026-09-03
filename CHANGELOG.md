@@ -1,5 +1,15 @@
 # WorkBuddy Switch Changelog
 
+## Unreleased
+
+- Fix WorkBuddy 5.4+ detection: the client now ships as `com.tencent.workbuddy.mac`,
+  so resume and account switching reported "未找到 WorkBuddy", the settings page
+  showed the client as uninstalled, and running-instance detection missed the new
+  build. Both identifiers are resolved, with the current build preferred and the
+  pre-5.4 identifier kept as a fallback.
+- Add offline self-tests for WorkBuddy application discovery, covering candidate
+  ordering, new-build preference, legacy fallback, and the missing-install case.
+
 ## 0.2.0 - 2026-07-25
 
 - Add a unified provider switcher for WorkBuddy, Trae CN, and TRAE Work.

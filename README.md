@@ -213,7 +213,7 @@ Trae CN 与 TRAE Work 的用量视图展示 Trae API 为当前账号返回的结
 |:---|:---|
 | macOS | 13 Ventura 或更高版本 |
 | Mac 芯片 | Apple Silicon 与 Intel |
-| WorkBuddy | macOS 桌面版；当前在 5.3.3 上验证 |
+| WorkBuddy | macOS 桌面版；当前在 5.3.3、5.4.7 上验证（自动适配 5.4+ 变更的 bundle ID） |
 | Trae CN | 账号切换与 Trae API 用量/额度视图；不支持对话浏览或恢复 |
 | TRAE Work | 账号切换与 Trae API 用量/额度视图；不支持对话浏览或恢复 |
 | 界面语言 | 简体中文 |
