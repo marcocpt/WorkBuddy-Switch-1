@@ -162,12 +162,16 @@ struct TraeAccountsView: View {
                 .foregroundStyle(.tertiary)
 
             Menu {
-                Button("重命名", systemImage: "pencil") {
+                Button {
                     renameValue = profile.nickname
                     renaming = profile
+                } label: {
+                    Label("重命名", systemImage: "pencil")
                 }
-                Button("移除快照", systemImage: "trash", role: .destructive) {
+                Button(role: .destructive) {
                     pendingRemoval = profile
+                } label: {
+                    Label("移除快照", systemImage: "trash")
                 }
             } label: {
                 Image(systemName: "ellipsis")

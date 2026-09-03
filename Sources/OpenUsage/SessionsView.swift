@@ -147,119 +147,136 @@ struct SessionsView: View {
     @ViewBuilder
     private var detail: some View {
         if let session = selectedSession {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 26) {
-                    HStack(alignment: .top, spacing: 18) {
-                        VStack(alignment: .leading, spacing: 7) {
-                            Text(session.title)
-                                .font(.system(size: 24, weight: .semibold))
-                                .textSelection(.enabled)
-                            Text(session.id)
-                                .font(.system(size: 11, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                                .textSelection(.enabled)
-                        }
-                        Spacer()
-                        Button {
-                            Task { await state.openInTerminal(session) }
-                        } label: {
-                            Image(systemName: "terminal")
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.large)
-                        .help(terminalActionTitle(session))
-                        .accessibilityLabel(terminalActionTitle(session))
-                        .disabled(!state.canResume(session))
-
-                        Button {
-                            Task { await state.resume(session) }
-                        } label: {
-                            if state.resumingSessionID == session.id {
-                                Label("正在准备", systemImage: "clock")
-                            } else {
-                                Label(
-                                    state.resumeActionTitle(session),
-                                    systemImage: "arrow.up.forward.app"
-                                )
-                            }
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.large)
-                        .disabled(!state.canResume(session))
-                    }
-
-                    if accounts.currentUserID == nil {
-                        Label("请先在 WorkBuddy 登录要继续使用的账号", systemImage: "person.crop.circle.badge.exclamationmark")
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(.orange)
-                    } else if state.sessionNeedsMigration(session) {
-                        VStack(alignment: .leading, spacing: 5) {
-                            Label(
-                                "继续后会将此对话迁移到当前账号，不会切换 WorkBuddy 登录账号。",
-                                systemImage: "arrow.left.arrow.right"
-                            )
-                            Text("该对话的历史本地 Token 与 Credits 也会归入当前账号。")
-                                .foregroundStyle(.secondary)
-                        }
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(OpenUsageColors.blue)
-                    }
-
-                    Divider()
-
-                    detailGrid(session)
-
-                    if let usage = state.usage.sessions.first(where: { $0.sessionID == session.id }) {
-                        VStack(alignment: .leading, spacing: 14) {
-                            Text("Token 明细")
-                                .font(.system(size: 16, weight: .semibold))
-                            LazyVGrid(
-                                columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 4),
-                                spacing: 10
-                            ) {
-                                compactMetric("净输入", usage.tokens.input, OpenUsageColors.blue)
-                                compactMetric("输出", usage.tokens.output, OpenUsageColors.coral)
-                                compactMetric("缓存命中", usage.tokens.cacheRead, OpenUsageColors.lime)
-                                compactMetric("思考", usage.tokens.reasoning, OpenUsageColors.cyan)
-                            }
-                        }
-                    }
-
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("工作目录")
-                            .font(.system(size: 16, weight: .semibold))
-                        HStack {
-                            Image(systemName: "folder")
-                                .foregroundStyle(.secondary)
-                            Text(session.workingDirectory)
-                                .font(.system(size: 12, design: .monospaced))
-                                .textSelection(.enabled)
-                            Spacer()
-                            Button {
-                                NSWorkspace.shared.selectFile(
-                                    nil,
-                                    inFileViewerRootedAtPath: session.workingDirectory
-                                )
-                            } label: {
-                                Image(systemName: "arrow.right.circle")
-                            }
-                            .buttonStyle(.borderless)
-                            .help("在访达中显示")
-                            .accessibilityLabel("在访达中显示")
-                        }
-                        .padding(12)
-                        .background(OpenUsageColors.faintFill)
-                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                    }
-                }
-                .padding(28)
-            }
+            detailContent(session)
         } else {
             EmptyStateView(
                 systemImage: "bubble.left.and.bubble.right",
                 title: "选择一个对话",
                 message: "查看详情并继续之前的工作。"
             )
+        }
+    }
+
+    private func detailContent(_ session: SessionRecord) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 26) {
+                detailHeader(session)
+                detailMigrationNotice(session)
+                Divider()
+                detailGrid(session)
+                detailTokenSection(session)
+                detailWorkingDirectorySection(session)
+            }
+            .padding(28)
+        }
+    }
+
+    private func detailHeader(_ session: SessionRecord) -> some View {
+        HStack(alignment: .top, spacing: 18) {
+            VStack(alignment: .leading, spacing: 7) {
+                Text(session.title)
+                    .font(.system(size: 24, weight: .semibold))
+                    .textSelection(.enabled)
+                Text(session.id)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+            Spacer()
+            Button {
+                Task { await state.openInTerminal(session) }
+            } label: {
+                Image(systemName: "terminal")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.large)
+            .help(terminalActionTitle(session))
+            .accessibilityLabel(terminalActionTitle(session))
+            .disabled(!state.canResume(session))
+
+            Button {
+                Task { await state.resume(session) }
+            } label: {
+                if state.resumingSessionID == session.id {
+                    Label("正在准备", systemImage: "clock")
+                } else {
+                    Label(
+                        state.resumeActionTitle(session),
+                        systemImage: "arrow.up.forward.app"
+                    )
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+            .disabled(!state.canResume(session))
+        }
+    }
+
+    @ViewBuilder
+    private func detailMigrationNotice(_ session: SessionRecord) -> some View {
+        if accounts.currentUserID == nil {
+            Label("请先在 WorkBuddy 登录要继续使用的账号", systemImage: "person.crop.circle.badge.exclamationmark")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.orange)
+        } else if state.sessionNeedsMigration(session) {
+            VStack(alignment: .leading, spacing: 5) {
+                Label(
+                    "继续后会将此对话迁移到当前账号，不会切换 WorkBuddy 登录账号。",
+                    systemImage: "arrow.left.arrow.right"
+                )
+                Text("该对话的历史本地 Token 与 Credits 也会归入当前账号。")
+                    .foregroundStyle(.secondary)
+            }
+            .font(.system(size: 11, weight: .medium))
+            .foregroundStyle(OpenUsageColors.blue)
+        }
+    }
+
+    @ViewBuilder
+    private func detailTokenSection(_ session: SessionRecord) -> some View {
+        if let usage = state.usage.sessions.first(where: { $0.sessionID == session.id }) {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Token 明细")
+                    .font(.system(size: 16, weight: .semibold))
+                LazyVGrid(
+                    columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 4),
+                    spacing: 10
+                ) {
+                    compactMetric("净输入", usage.tokens.input, OpenUsageColors.blue)
+                    compactMetric("输出", usage.tokens.output, OpenUsageColors.coral)
+                    compactMetric("缓存命中", usage.tokens.cacheRead, OpenUsageColors.lime)
+                    compactMetric("思考", usage.tokens.reasoning, OpenUsageColors.cyan)
+                }
+            }
+        }
+    }
+
+    private func detailWorkingDirectorySection(_ session: SessionRecord) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("工作目录")
+                .font(.system(size: 16, weight: .semibold))
+            HStack {
+                Image(systemName: "folder")
+                    .foregroundStyle(.secondary)
+                Text(session.workingDirectory)
+                    .font(.system(size: 12, design: .monospaced))
+                    .textSelection(.enabled)
+                Spacer()
+                Button {
+                    NSWorkspace.shared.selectFile(
+                        nil,
+                        inFileViewerRootedAtPath: session.workingDirectory
+                    )
+                } label: {
+                    Image(systemName: "arrow.right.circle")
+                }
+                .buttonStyle(.borderless)
+                .help("在访达中显示")
+                .accessibilityLabel("在访达中显示")
+            }
+            .padding(12)
+            .background(OpenUsageColors.faintFill)
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         }
     }
 

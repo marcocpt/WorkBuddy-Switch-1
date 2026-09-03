@@ -225,7 +225,7 @@ Trae CN 与 TRAE Work 的用量视图展示 Trae API 为当前账号返回的结
 
 ## 本地构建
 
-需要 Apple Command Line Tools 和 Swift 5.10+：
+需要 Xcode 14.1+（Swift 5.7+）和 Apple Command Line Tools：
 
 ```bash
 git clone https://github.com/koi128bit/WorkBuddy-Switch.git
