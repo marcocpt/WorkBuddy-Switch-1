@@ -2,7 +2,11 @@ import Foundation
 import Security
 
 struct KeychainVault {
-    private let service = "com.koi128bit.openusage.workbuddy-account.v1"
+    private let service: String
+
+    init(service: String = "com.koi128bit.openusage.workbuddy-account.v1") {
+        self.service = service
+    }
 
     func save(_ data: Data, account: String) throws {
         let key: [String: Any] = [
@@ -80,6 +84,43 @@ struct KeychainVault {
             throw OpenUsageError.keychain(message(for: status))
         }
         return data
+    }
+
+    /// 严格只读批量读取：单次 SecItemCopyMatching 取回 service 下全部凭据，按 account 映射。
+    /// Keychain 锁定/需授权时只触发一次解锁提示（逐账号读取会按账号数量重复弹窗）。
+    /// 返回空字典表示 service 下无条目；Keychain 故障抛错，绝不当作空处理。
+    func loadAllData() throws -> [String: Data] {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecReturnData as String: true,
+            kSecReturnAttributes as String: true,
+            // 用数字 limit：kSecMatchLimitAll 字符串与 kSecReturnData 组合在 macOS 13 返回 errSecParam(-50)。
+            kSecMatchLimit as String: 10_000
+        ]
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        switch status {
+        case errSecSuccess:
+            var map: [String: Data] = [:]
+            if let items = result as? [[String: Any]] {
+                for item in items {
+                    if let account = item[kSecAttrAccount as String] as? String,
+                       let data = item[kSecValueData as String] as? Data {
+                        map[account] = data
+                    }
+                }
+            } else if let single = result as? [String: Any],
+                      let account = single[kSecAttrAccount as String] as? String,
+                      let data = single[kSecValueData as String] as? Data {
+                map[account] = data
+            }
+            return map
+        case errSecItemNotFound:
+            return [:]
+        default:
+            throw OpenUsageError.keychain(message(for: status))
+        }
     }
 
     /// 无副作用存在性探测：存在=true，不存在=false，其他错误抛出（绝不当作「不存在」处理）。

@@ -205,19 +205,28 @@ final class AccountBackupService: ObservableObject {
     ) -> BackupImportSummary {
         isBusy = true
         defer { isBusy = false }
+        // 先各做一次批量存在性判定（单次 Keychain 访问），后续逐条判定走内存集合，
+        // 避免 Keychain 锁定/需授权时按账号数量重复弹窗。
+        // 批量读取失败必须保留错误并逐条传播（fail-closed）：不得转成空集合，
+        // 否则会把「存在性未知」当作「不存在」而进入写入路径。
+        let wbExisting: Result<Set<String>, Error>
+        do {
+            wbExisting = .success(try workBuddy.existingAccountIDs())
+        } catch {
+            wbExisting = .failure(error)
+        }
+        let traeExisting: Result<Set<String>, Error>
+        do {
+            traeExisting = .success(try traeAccounts.existingAccountKeys())
+        } catch {
+            traeExisting = .failure(error)
+        }
         return AccountBackupCore.importSummary(
             records: envelope.accounts,
-            vaultStatus: { record in
-                switch record.credential {
-                case .workBuddy:
-                    return try workBuddy.snapshotPresence(for: record.metadata.accountID)
-                case .trae(let snapshot):
-                    return try traeAccounts.hasSnapshot(
-                        variant: snapshot.variant,
-                        userID: record.metadata.accountID
-                    )
-                }
-            },
+            vaultStatus: Self.vaultStatusForBulkPresence(
+                wbExisting: wbExisting,
+                traeExisting: traeExisting
+            ),
             applyRecord: { record in
                 switch record.credential {
                 case .workBuddy(let blob):
@@ -233,5 +242,23 @@ final class AccountBackupService: ObservableObject {
                 }
             }
         )
+    }
+
+    /// 由批量存在性判定结果构造 vaultStatus：批量读取失败时逐条重抛同一错误
+    /// （fail-closed，绝不当作「不存在」），成功后查内存集合（不再访问 Keychain）。
+    static func vaultStatusForBulkPresence(
+        wbExisting: Result<Set<String>, Error>,
+        traeExisting: Result<Set<String>, Error>
+    ) -> (BackupAccountRecord) throws -> Bool {
+        { record in
+            switch record.credential {
+            case .workBuddy:
+                return try wbExisting.get().contains(record.metadata.accountID)
+            case .trae(let snapshot):
+                return try traeExisting.get().contains(
+                    "\(snapshot.variant.rawValue):\(record.metadata.accountID)"
+                )
+            }
+        }
     }
 }

@@ -2462,6 +2462,82 @@ enum OpenUsageSelfTest {
             "export leaves the source vault and index untouched"
         )
 
+        // T-ST-04：导出走单次批量读取（loadAll 一次，不再逐账号 load）——根因：Keychain 锁定/需授权时
+        // 逐账号 SecItemCopyMatching 会按账号数量重复弹解锁提示。
+        let loadAllCallsBefore = backupSourceVault.loadAllCalls
+        let loadCallsBefore = backupSourceVault.loadCalls
+        _ = backupSourceStore.backupExportItems()
+        try expect(
+            backupSourceVault.loadAllCalls == loadAllCallsBefore + 1
+                && backupSourceVault.loadCalls == loadCallsBefore,
+            "export enumerates snapshots via a single bulk loadAll (no per-account loads)"
+        )
+
+        // T-KC-01：KeychainVault 批量读取（独立测试 service，单次访问取回全部并正确映射）
+        let bulkService = "com.koi128bit.openusage.selftest.bulk.\(UUID().uuidString)"
+        let bulkVault = KeychainVault(service: bulkService)
+        let bulkAccounts = ["bulk-a", "bulk-b", "bulk-c"]
+        for (index, account) in bulkAccounts.enumerated() {
+            try bulkVault.save(Data("bulk-blob-\(index)".utf8), account: account)
+        }
+        defer {
+            for account in bulkAccounts {
+                try? bulkVault.delete(account: account)
+            }
+        }
+        let bulkMap = try bulkVault.loadAllData()
+        try expect(
+            bulkMap.count == 3
+                && bulkMap["bulk-a"] == Data("bulk-blob-0".utf8)
+                && bulkMap["bulk-b"] == Data("bulk-blob-1".utf8)
+                && bulkMap["bulk-c"] == Data("bulk-blob-2".utf8),
+            "keychain bulk read returns all accounts in one call"
+        )
+        let emptyBulkVault = KeychainVault(
+            service: "com.koi128bit.openusage.selftest.empty.\(UUID().uuidString)"
+        )
+        let emptyBulkMap = try emptyBulkVault.loadAllData()
+        try expect(
+            emptyBulkMap.isEmpty,
+            "keychain bulk read on an empty service returns an empty map"
+        )
+
+        // T-KC-02：批量存在性判定失败时 fail-closed（逐条 failed，绝不进入写入路径）
+        let bulkFailure: Result<Set<String>, Error> = .failure(
+            OpenUsageError.keychain("locked")
+        )
+        let bulkFailureStatus = AccountBackupService.vaultStatusForBulkPresence(
+            wbExisting: bulkFailure,
+            traeExisting: bulkFailure
+        )
+        var bulkFailureApplyCalls = 0
+        let bulkFailureSummary = AccountBackupCore.importSummary(
+            records: [
+                BackupAccountRecord(
+                    provider: .workBuddy,
+                    metadata: backupMetadata("user-123"),
+                    credential: .workBuddy(authData)
+                ),
+                BackupAccountRecord(
+                    provider: .traeCN,
+                    metadata: backupMetadata("t-user-1"),
+                    credential: .trae(chinaSnapshot)
+                )
+            ],
+            vaultStatus: bulkFailureStatus,
+            applyRecord: { _ in
+                bulkFailureApplyCalls += 1
+                return .inserted
+            }
+        )
+        try expect(
+            bulkFailureSummary.failed == 2
+                && bulkFailureSummary.imported == 0
+                && bulkFailureSummary.skipped == 0
+                && bulkFailureApplyCalls == 0,
+            "bulk presence failure fails all records without any writes (fail-closed)"
+        )
+
         let backupTargetVault = FixtureTraeVault()
         let backupTargetStore = TraeAccountStore(
             indexURL: backupTraeIndexURL.appendingPathExtension("target"),
@@ -2915,6 +2991,8 @@ private func fixtureTraeStorage(
 private final class FixtureTraeVault: TraeCredentialVaulting, @unchecked Sendable {
     private(set) var snapshots: [String: TraeCredentialSnapshot] = [:]
     private(set) var savedAccounts = Set<String>()
+    private(set) var loadAllCalls = 0
+    private(set) var loadCalls = 0
 
     func save(_ snapshot: TraeCredentialSnapshot) throws {
         snapshots[snapshot.keychainAccount] = snapshot
@@ -2925,6 +3003,7 @@ private final class FixtureTraeVault: TraeCredentialVaulting, @unchecked Sendabl
         variant: TraeVariant,
         userID: String
     ) throws -> TraeCredentialSnapshot {
+        loadCalls += 1
         guard let snapshot = snapshots["\(variant.rawValue):\(userID)"] else {
             throw TraeSupportError.accountSnapshotMissing
         }
@@ -2933,6 +3012,11 @@ private final class FixtureTraeVault: TraeCredentialVaulting, @unchecked Sendabl
 
     func probeExistence(variant: TraeVariant, userID: String) throws -> Bool {
         snapshots["\(variant.rawValue):\(userID)"] != nil
+    }
+
+    func loadAll() throws -> [String: TraeCredentialSnapshot] {
+        loadAllCalls += 1
+        return snapshots
     }
 
     func insertIfAbsent(_ snapshot: TraeCredentialSnapshot) throws -> Bool {
