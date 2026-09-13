@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Fix Trae CN usage reads after switching to an account whose login has
+  expired: the app now prefers the live storage credentials maintained by the
+  running Trae app, waits and retries automatically on 401/403 instead of
+  showing a modal error, and falls back to an inline message only after the
+  retry budget is exhausted.
 - Fix WorkBuddy 5.4+ detection: the client now ships as `com.tencent.workbuddy.mac`,
   so resume and account switching reported "未找到 WorkBuddy", the settings page
   showed the client as uninstalled, and running-instance detection missed the new
