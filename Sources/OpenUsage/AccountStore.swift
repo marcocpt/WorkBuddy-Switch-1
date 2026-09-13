@@ -130,8 +130,48 @@ final class AccountStore: ObservableObject {
         }
     }
 
-    func hasSnapshot(for userID: String) -> Bool {
-        (try? vault.load(account: userID)) != nil
+    /// 无副作用存在性探测：读取失败时抛错（绝不当作「不存在」）。
+    func snapshotPresence(for userID: String) throws -> Bool {
+        try vault.probeExistence(account: userID)
+    }
+
+    /// 导出用：枚举全部索引账号并镜像钥匙串凭据（严格只读；缺失快照返回 blob=nil，不中断）。
+    func backupExportItems() -> [(profile: AccountProfile, blob: Data?)] {
+        accounts.map { profile in
+            (profile, try? vault.loadData(account: profile.id))
+        }
+    }
+
+    /// 导入用：仅创建写入 + 补偿事务。凭据身份校验通过后，若钥匙串已存在则跳过；
+    /// 索引保存失败时回滚本次新建的钥匙串项，避免幽灵账号。
+    @discardableResult
+    func importSnapshot(profile: AccountProfile, blob: Data) throws -> BackupImportApplyResult {
+        try requireNoActiveSwitch()
+        let document = try AuthDocument(data: blob)
+        guard document.userID == profile.id else {
+            throw OpenUsageError.commandFailed(
+                "备份文件中的凭据身份与账号不匹配，已跳过。"
+            )
+        }
+        let previousAccounts = accounts
+        let inserted = try vault.insertIfAbsent(blob, account: profile.id)
+        guard inserted else { return .alreadyExists }
+        if !accounts.contains(where: { $0.id == profile.id }) {
+            accounts.append(profile)
+            accounts.sort { $0.lastUsedAt > $1.lastUsedAt }
+        }
+        do {
+            try saveIndex()
+        } catch {
+            accounts = previousAccounts
+            guard (try? vault.delete(account: profile.id)) != nil else {
+                throw OpenUsageError.commandFailed(
+                    "导入失败且回滚未完全成功：\(error.localizedDescription)"
+                )
+            }
+            throw error
+        }
+        return .inserted
     }
 
     private func loadIndex() {
@@ -245,11 +285,31 @@ final class AccountStore: ObservableObject {
     private func saveIndex() throws {
         try AppPaths.prepareAppSupport()
         let data = try encoder.encode(accounts)
-        try data.write(to: AppPaths.accountIndex, options: [.atomic])
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o600],
-            ofItemAtPath: AppPaths.accountIndex.path
+        // commit-last：所有可能失败的步骤（编码/写临时文件/设权限）都在原子替换之前完成。
+        let directory = AppPaths.accountIndex.deletingLastPathComponent()
+        let temporary = directory.appendingPathComponent(
+            ".openusage-accounts-\(UUID().uuidString).tmp"
         )
+        do {
+            try data.write(to: temporary, options: [.atomic])
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: temporary.path
+            )
+            if FileManager.default.fileExists(atPath: AppPaths.accountIndex.path) {
+                _ = try FileManager.default.replaceItemAt(
+                    AppPaths.accountIndex,
+                    withItemAt: temporary,
+                    backupItemName: nil,
+                    options: [.usingNewMetadataOnly]
+                )
+            } else {
+                try FileManager.default.moveItem(at: temporary, to: AppPaths.accountIndex)
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: temporary)
+            throw error
+        }
     }
 
     private func writeAuthenticationAtomically(_ data: Data) throws {

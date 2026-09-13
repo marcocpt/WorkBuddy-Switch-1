@@ -9,6 +9,12 @@
   pre-5.4 identifier kept as a fallback.
 - Add offline self-tests for WorkBuddy application discovery, covering candidate
   ordering, new-build preference, legacy fallback, and the missing-install case.
+- Add an account backup flow in Settings: export all saved snapshots (WorkBuddy,
+  Trae CN, and TRAE Work) to a single password-encrypted backup file, and import
+  accounts from such a file. The backup uses AES-256-GCM with a key derived from
+  the user password (PBKDF2-HMAC-SHA256); the password cannot be recovered if
+  lost. Import skips accounts that already exist in the Keychain and never
+  overwrites them.
 
 ## 0.2.0 - 2026-07-25
 

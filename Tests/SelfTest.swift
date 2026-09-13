@@ -1988,6 +1988,736 @@ enum OpenUsageSelfTest {
             "Trae quota parser supports legacy request-count plans"
         )
 
+        // MARK: - 导入 / 导出账号备份：载荷核心（Phase 1）
+
+        let backupDate = Date(timeIntervalSince1970: 1_750_000_000)
+
+        let workBuddyBlob = Data(
+            """
+            {
+              "account": { "uid": "wb-user-1", "nickname": "WB", "accountType": "pro" },
+              "auth": { "accessToken": "wb-token" }
+            }
+            """.utf8
+        )
+        let chinaAuthFixture = try fixtureTraeAuth(
+            userID: "t-user-1",
+            token: "chn-token",
+            host: "api.trae.cn",
+            displayName: "Fixture CN",
+            keyByte: 31
+        )
+        let workAuthFixture = try fixtureTraeAuth(
+            userID: "t-user-2",
+            token: "wrk-token",
+            host: "grow-normal.trae.ai",
+            displayName: "Fixture Work",
+            keyByte: 32
+        )
+        let chinaSnapshot = TraeCredentialSnapshot(
+            variant: .china,
+            userID: try TraeStorageCodec.authPayload(from: chinaAuthFixture.blob).userID,
+            authBlob: chinaAuthFixture.blob,
+            userTagBlob: nil,
+            deviceAuthBlobs: ["d": "x"],
+            capturedAt: backupDate
+        )
+        let workSnapshot = TraeCredentialSnapshot(
+            variant: .work,
+            userID: try TraeStorageCodec.authPayload(from: workAuthFixture.blob).userID,
+            authBlob: workAuthFixture.blob,
+            userTagBlob: "tag",
+            deviceAuthBlobs: [:],
+            capturedAt: backupDate
+        )
+
+        func backupMetadata(
+            _ id: String,
+            nickname: String = "n"
+        ) -> BackupAccountMetadata {
+            BackupAccountMetadata(
+                accountID: id,
+                nickname: nickname,
+                accountType: nil,
+                phoneHint: nil,
+                email: nil,
+                avatarURL: nil,
+                capturedAt: backupDate,
+                lastUsedAt: backupDate
+            )
+        }
+
+        // T-PL-01 / T-PL-02：三端混合记录往返与格式自描述
+        let backupRecords: [BackupAccountRecord] = [
+            BackupAccountRecord(
+                provider: .workBuddy,
+                metadata: backupMetadata("wb-user-1", nickname: "WB"),
+                credential: .workBuddy(workBuddyBlob)
+            ),
+            BackupAccountRecord(
+                provider: .traeCN,
+                metadata: backupMetadata("t-user-1"),
+                credential: .trae(chinaSnapshot)
+            ),
+            BackupAccountRecord(
+                provider: .traeWork,
+                metadata: backupMetadata("t-user-2"),
+                credential: .trae(workSnapshot)
+            )
+        ]
+        let backupEnvelope = BackupEnvelope(
+            format: BackupEnvelope.currentFormat,
+            version: BackupEnvelope.currentVersion,
+            exportedAt: backupDate,
+            accounts: backupRecords
+        )
+        let backupEncoder = JSONEncoder()
+        backupEncoder.dateEncodingStrategy = .iso8601
+        let backupDecoder = JSONDecoder()
+        backupDecoder.dateDecodingStrategy = .iso8601
+        let backupEnvelopeData = try backupEncoder.encode(backupEnvelope)
+        let decodedBackupEnvelope = try backupDecoder.decode(
+            BackupEnvelope.self,
+            from: backupEnvelopeData
+        )
+        try expect(
+            decodedBackupEnvelope == backupEnvelope,
+            "backup envelope round-trips across providers"
+        )
+        try expect(
+            decodedBackupEnvelope.format == "workbuddy-switch-accounts"
+                && decodedBackupEnvelope.version == 1
+                && decodedBackupEnvelope.exportedAt == backupDate,
+            "backup envelope is self-describing (format/version/exportedAt)"
+        )
+
+        // T-VL-01：WorkBuddy 身份校验
+        try expect(
+            validateBackupRecord(
+                BackupAccountRecord(
+                    provider: .workBuddy,
+                    metadata: backupMetadata("wb-user-1"),
+                    credential: .workBuddy(workBuddyBlob)
+                )
+            ) == nil,
+            "valid WorkBuddy record passes identity validation"
+        )
+        try expect(
+            validateBackupRecord(
+                BackupAccountRecord(
+                    provider: .workBuddy,
+                    metadata: backupMetadata("other-user"),
+                    credential: .workBuddy(workBuddyBlob)
+                )
+            ) == .identityMismatch,
+            "WorkBuddy credential identity mismatch is rejected"
+        )
+        try expect(
+            validateBackupRecord(
+                BackupAccountRecord(
+                    provider: .workBuddy,
+                    metadata: backupMetadata("wb-user-1"),
+                    credential: .workBuddy(Data("not-json".utf8))
+                )
+            ) == .invalidCredential,
+            "malformed WorkBuddy credential is rejected as invalid"
+        )
+
+        // T-VL-02：Trae 变体 / 账号 ID 校验与映射
+        try expect(
+            traeVariant(for: .traeCN) == .china
+                && traeVariant(for: .traeWork) == .work
+                && traeVariant(for: .workBuddy) == nil,
+            "backup provider maps to the correct Trae variant"
+        )
+        try expect(
+            validateBackupRecord(
+                BackupAccountRecord(
+                    provider: .traeCN,
+                    metadata: backupMetadata("t-user-1"),
+                    credential: .trae(chinaSnapshot)
+                )
+            ) == nil,
+            "valid Trae CN record passes identity validation"
+        )
+        try expect(
+            validateBackupRecord(
+                BackupAccountRecord(
+                    provider: .traeCN,
+                    metadata: backupMetadata("t-user-1"),
+                    credential: .trae(workSnapshot)
+                )
+            ) == .identityMismatch,
+            "Trae variant mismatch is rejected"
+        )
+        try expect(
+            validateBackupRecord(
+                BackupAccountRecord(
+                    provider: .traeWork,
+                    metadata: backupMetadata("t-user-9"),
+                    credential: .trae(workSnapshot)
+                )
+            ) == .identityMismatch,
+            "Trae userID mismatch is rejected"
+        )
+
+        // T-VL-03：凭据内嵌身份（authBlob）与快照字段/元数据不一致 → 拒绝
+        let spoofedSnapshot = TraeCredentialSnapshot(
+            variant: .china,
+            userID: "spoofed-user",
+            authBlob: chinaAuthFixture.blob,
+            userTagBlob: nil,
+            deviceAuthBlobs: [:],
+            capturedAt: backupDate
+        )
+        try expect(
+            validateBackupRecord(
+                BackupAccountRecord(
+                    provider: .traeCN,
+                    metadata: backupMetadata("spoofed-user"),
+                    credential: .trae(spoofedSnapshot)
+                )
+            ) == .identityMismatch,
+            "Trae authBlob inner identity must match the snapshot and metadata"
+        )
+
+        // T-VL-04：provider 与凭据类型错配 → 拒绝
+        try expect(
+            validateBackupRecord(
+                BackupAccountRecord(
+                    provider: .traeCN,
+                    metadata: backupMetadata("wb-user-1"),
+                    credential: .workBuddy(workBuddyBlob)
+                )
+            ) == .identityMismatch,
+            "WorkBuddy credential under a Trae provider is rejected"
+        )
+        try expect(
+            validateBackupRecord(
+                BackupAccountRecord(
+                    provider: .workBuddy,
+                    metadata: backupMetadata("t-user-2"),
+                    credential: .trae(workSnapshot)
+                )
+            ) == .identityMismatch,
+            "Trae credential under the WorkBuddy provider is rejected"
+        )
+
+        // T-CF-01..03：冲突决策与索引合并
+        try expect(
+            backupImportAction(vaultHasRecord: true) == .skip
+                && backupImportAction(vaultHasRecord: false) == .apply,
+            "import skips only when the vault already has the account"
+        )
+        let localExistingMetadata = backupMetadata("wb-user-1", nickname: "本机昵称")
+        let importedMetadata = backupMetadata("wb-user-1", nickname: "备份昵称")
+        try expect(
+            mergeIndexMetadata(existing: localExistingMetadata, imported: importedMetadata)
+                == localExistingMetadata,
+            "existing index metadata is preserved on import"
+        )
+        try expect(
+            mergeIndexMetadata(existing: nil, imported: importedMetadata) == importedMetadata,
+            "missing index metadata is appended from the import"
+        )
+
+        // MARK: - 导入 / 导出账号备份：加密文件编解码（Phase 2）
+
+        let backupPayloadJSON = Data(
+            "{\"format\":\"workbuddy-switch-accounts\",\"version\":1}".utf8
+        )
+        let backupFileA = try AccountBackupFile.encryptedFile(
+            payloadJSON: backupPayloadJSON,
+            password: "correct-horse-1"
+        )
+        let backupFileB = try AccountBackupFile.encryptedFile(
+            payloadJSON: backupPayloadJSON,
+            password: "correct-horse-1"
+        )
+        let decryptedBackup = try AccountBackupFile.decryptedPayload(
+            fileData: backupFileA,
+            password: "correct-horse-1"
+        )
+        try expect(
+            decryptedBackup == backupPayloadJSON,
+            "backup file round-trips with the correct password"
+        )
+        try expect(
+            backupFileA != backupPayloadJSON,
+            "backup file is not plaintext"
+        )
+        try expect(
+            backupFileA != backupFileB,
+            "repeated exports differ by random salt and nonce"
+        )
+
+        do {
+            _ = try AccountBackupFile.decryptedPayload(
+                fileData: backupFileA,
+                password: "wrong-password-1"
+            )
+            try expect(false, "wrong password must be rejected")
+        } catch let error as AccountBackupFileError {
+            try expect(
+                error == .authenticationFailed,
+                "wrong password maps to authenticationFailed"
+            )
+        }
+
+        var tamperedFile = backupFileA
+        tamperedFile[tamperedFile.count - 1] ^= 0xFF
+        do {
+            _ = try AccountBackupFile.decryptedPayload(
+                fileData: tamperedFile,
+                password: "correct-horse-1"
+            )
+            try expect(false, "tampered ciphertext must be rejected")
+        } catch let error as AccountBackupFileError {
+            try expect(
+                error == .authenticationFailed,
+                "tampered ciphertext maps to authenticationFailed"
+            )
+        }
+
+        var upgradedFile = backupFileA
+        upgradedFile[upgradedFile.startIndex + 8] = 2
+        do {
+            _ = try AccountBackupFile.decryptedPayload(
+                fileData: upgradedFile,
+                password: "correct-horse-1"
+            )
+            try expect(false, "unsupported version must be rejected")
+        } catch let error as AccountBackupFileError {
+            try expect(
+                error == .unsupportedVersion,
+                "unsupported version maps to unsupportedVersion"
+            )
+        }
+
+        var brokenMagicFile = backupFileA
+        brokenMagicFile[brokenMagicFile.startIndex] = 0x00
+        do {
+            _ = try AccountBackupFile.decryptedPayload(
+                fileData: brokenMagicFile,
+                password: "correct-horse-1"
+            )
+            try expect(false, "broken magic must be rejected")
+        } catch let error as AccountBackupFileError {
+            try expect(
+                error == .notABackupFile,
+                "broken magic maps to notABackupFile"
+            )
+        }
+
+        for brokenInput: Data in [
+            Data(),
+            Data(backupFileA.prefix(backupFileA.count - 20)),
+            Data(backupFileA.prefix(backupFileA.count - 17))
+        ] {
+            do {
+                _ = try AccountBackupFile.decryptedPayload(
+                    fileData: brokenInput,
+                    password: "correct-horse-1"
+                )
+                try expect(false, "truncated input must be rejected")
+            } catch let error as AccountBackupFileError {
+                try expect(
+                    (
+                        error == .malformed
+                            || error == .notABackupFile
+                            || error == .authenticationFailed
+                    ),
+                    "truncated input must be rejected with a readable error"
+                )
+            }
+        }
+
+        // MARK: - 导入 / 导出账号备份：编排与仓库集成（Phase 3）
+
+        // T-GT-01：导入计数与分类（纯核心）
+        let invalidIdentityRecord = BackupAccountRecord(
+            provider: .traeCN,
+            metadata: backupMetadata("phantom-user"),
+            credential: .trae(chinaSnapshot)
+        )
+        let countSummary = AccountBackupCore.importSummary(
+            records: [
+                BackupAccountRecord(
+                    provider: .traeWork,
+                    metadata: backupMetadata("t-user-2"),
+                    credential: .trae(workSnapshot)
+                ),
+                BackupAccountRecord(
+                    provider: .traeCN,
+                    metadata: backupMetadata("t-user-1"),
+                    credential: .trae(chinaSnapshot)
+                ),
+                invalidIdentityRecord
+            ],
+            vaultStatus: { record in
+                record.metadata.accountID == "t-user-1"
+            },
+            applyRecord: { _ in .inserted }
+        )
+        try expect(
+            countSummary.imported == 1
+                && countSummary.skipped == 1
+                && countSummary.failed == 1
+                && countSummary.failures.count == 1,
+            "import summary tallies imported/skipped/failed correctly"
+        )
+
+        // T-GT-02：无账号导出被拦截（纯核心）
+        do {
+            _ = try AccountBackupCore.exportEnvelope(
+                workBuddyItems: [],
+                traeItems: []
+            )
+            try expect(false, "empty export must be rejected")
+        } catch AccountBackupServiceError.emptyExport {
+        }
+
+        // T-ST-01/02/03：Trae 仓库端到端（FixtureTraeVault + 临时索引）
+        let backupTraeDirectory = directory.appendingPathComponent(
+            "backup-trae-store",
+            isDirectory: true
+        )
+        let backupChinaStorageURL = backupTraeDirectory
+            .appendingPathComponent("china", isDirectory: true)
+            .appendingPathComponent("storage.json")
+        let backupWorkStorageURL = backupTraeDirectory
+            .appendingPathComponent("work", isDirectory: true)
+            .appendingPathComponent("storage.json")
+        let backupTraeIndexURL = backupTraeDirectory.appendingPathComponent(
+            "trae-accounts.json"
+        )
+        let backupChinaAuth = try fixtureTraeAuth(
+            userID: "backup-china-user",
+            token: "backup-china-token",
+            host: "api.trae.cn",
+            displayName: "Backup China",
+            keyByte: 77
+        )
+        let backupWorkAuth = try fixtureTraeAuth(
+            userID: "backup-work-user",
+            token: "backup-work-token",
+            host: "grow-normal.trae.ai",
+            displayName: "Backup Work",
+            keyByte: 78
+        )
+        try TraeAtomicFile.write(
+            try fixtureTraeStorage(
+                authBlob: backupChinaAuth.blob,
+                userTag: "backup-china-tag",
+                deviceSuffix: "backup-china-device",
+                marker: "keep-backup-china"
+            ),
+            to: backupChinaStorageURL
+        )
+        try TraeAtomicFile.write(
+            try fixtureTraeStorage(
+                authBlob: backupWorkAuth.blob,
+                userTag: "backup-work-tag",
+                deviceSuffix: "backup-work-device",
+                marker: "keep-backup-work"
+            ),
+            to: backupWorkStorageURL
+        )
+        let backupSourceVault = FixtureTraeVault()
+        let backupSourceStore = TraeAccountStore(
+            indexURL: backupTraeIndexURL,
+            vault: backupSourceVault,
+            controller: FixtureTraeApplicationController(
+                installedVariants: Set(TraeVariant.allCases),
+                runningVariants: [],
+                launchFailuresRemaining: 0
+            ),
+            storageURL: { variant in
+                variant == .china ? backupChinaStorageURL : backupWorkStorageURL
+            }
+        )
+        _ = try backupSourceStore.captureCurrent(.china)
+        _ = try backupSourceStore.captureCurrent(.work)
+
+        let sourceItems = backupSourceStore.backupExportItems()
+        try expect(
+            sourceItems.count == 2
+                && sourceItems.allSatisfy { $0.snapshot != nil },
+            "backup export enumerates all Trae snapshots with credentials"
+        )
+        let exportBefore = backupSourceStore.accounts
+        let (exportEnvelope, exportSummary) = try AccountBackupCore.exportEnvelope(
+            workBuddyItems: [],
+            traeItems: sourceItems
+        )
+        try expect(
+            exportEnvelope.accounts.count == 2
+                && exportSummary.totalExported == 2
+                && exportSummary.skippedWithoutSnapshot == 0,
+            "Trae export produces a complete envelope"
+        )
+        try expect(
+            backupSourceStore.accounts == exportBefore
+                && backupSourceVault.savedAccounts.count == 2,
+            "export leaves the source vault and index untouched"
+        )
+
+        let backupTargetVault = FixtureTraeVault()
+        let backupTargetStore = TraeAccountStore(
+            indexURL: backupTraeIndexURL.appendingPathExtension("target"),
+            vault: backupTargetVault,
+            controller: FixtureTraeApplicationController(
+                installedVariants: Set(TraeVariant.allCases),
+                runningVariants: [],
+                launchFailuresRemaining: 0
+            ),
+            storageURL: { variant in
+                variant == .china ? backupChinaStorageURL : backupWorkStorageURL
+            }
+        )
+        let firstImport = AccountBackupCore.importSummary(
+            records: exportEnvelope.accounts,
+            vaultStatus: { record in
+                try backupTargetStore.hasSnapshot(
+                    variant: record.provider == .traeCN ? .china : .work,
+                    userID: record.metadata.accountID
+                )
+            },
+            applyRecord: { record in
+                let variant: TraeVariant = record.provider == .traeCN ? .china : .work
+                return try backupTargetStore.importSnapshot(
+                    profile: record.metadata.traeProfile(variant: variant),
+                    snapshot: try record.credential.traeSnapshot()
+                )
+            }
+        )
+        try expect(
+            firstImport.imported == 2
+                && firstImport.skipped == 0
+                && firstImport.failed == 0
+                && Set(backupTargetStore.accounts.map(\.id))
+                    == Set(exportBefore.map(\.id)),
+            "import restores accounts into a fresh store"
+        )
+        let secondImport = AccountBackupCore.importSummary(
+            records: exportEnvelope.accounts,
+            vaultStatus: { record in
+                try backupTargetStore.hasSnapshot(
+                    variant: record.provider == .traeCN ? .china : .work,
+                    userID: record.metadata.accountID
+                )
+            },
+            applyRecord: { _ -> BackupImportApplyResult in
+                throw SelfTestFailure(
+                    message: "import must not re-apply skipped accounts",
+                    file: #filePath,
+                    line: #line
+                )
+            }
+        )
+        try expect(
+            secondImport.skipped == 2 && secondImport.imported == 0,
+            "re-import skips already-restored accounts"
+        )
+
+        // T-ST-03：个别账号写入失败 → 计入失败，其余成功（fresh store 验证真实落盘状态）
+        let partialStoreVault = FixtureTraeVault()
+        let partialStore = TraeAccountStore(
+            indexURL: backupTraeIndexURL.appendingPathExtension("partial"),
+            vault: partialStoreVault,
+            controller: FixtureTraeApplicationController(
+                installedVariants: Set(TraeVariant.allCases),
+                runningVariants: [],
+                launchFailuresRemaining: 0
+            ),
+            storageURL: { variant in
+                variant == .china ? backupChinaStorageURL : backupWorkStorageURL
+            }
+        )
+        let partialImport = AccountBackupCore.importSummary(
+            records: exportEnvelope.accounts,
+            vaultStatus: { record in
+                try partialStore.hasSnapshot(
+                    variant: record.provider == .traeCN ? .china : .work,
+                    userID: record.metadata.accountID
+                )
+            },
+            applyRecord: { record in
+                if record.metadata.accountID == "backup-work-user" {
+                    throw OpenUsageError.keychain("fixture failure")
+                }
+                let variant: TraeVariant = record.provider == .traeCN ? .china : .work
+                return try partialStore.importSnapshot(
+                    profile: record.metadata.traeProfile(variant: variant),
+                    snapshot: try record.credential.traeSnapshot()
+                )
+            }
+        )
+        try expect(
+            partialImport.imported == 1
+                && partialImport.failed == 1
+                && partialStore.accounts.count == 1,
+            "a single failing account is tallied without blocking the rest in a fresh store"
+        )
+
+        // T-PROBE-01：存在性探测失败（钥匙串故障）→ 计入失败，绝不写入
+        var probeAttempts = 0
+        let probeFailureSummary = AccountBackupCore.importSummary(
+            records: [exportEnvelope.accounts[0]],
+            vaultStatus: { _ in
+                probeAttempts += 1
+                throw OpenUsageError.keychain("locked")
+            },
+            applyRecord: { _ -> BackupImportApplyResult in
+                try expect(false, "applyRecord must not run when the probe fails")
+                return .inserted
+            }
+        )
+        try expect(
+            probeFailureSummary.failed == 1
+                && probeFailureSummary.imported == 0
+                && probeFailureSummary.skipped == 0
+                && probeAttempts == 1,
+            "a failing existence probe is tallied as failure and never applied"
+        )
+
+        // T-INPUT-01：输入规模上限
+        do {
+            try validateAccountBackupInput(
+                byteCount: AccountBackupInputLimits.maxFileBytes + 1,
+                accountCount: 1
+            )
+            try expect(false, "oversized file must be rejected")
+        } catch AccountBackupInputError.fileTooLarge {
+        }
+        do {
+            try validateAccountBackupInput(
+                byteCount: 1,
+                accountCount: AccountBackupInputLimits.maxAccounts + 1
+            )
+            try expect(false, "too many accounts must be rejected")
+        } catch AccountBackupInputError.tooManyAccounts {
+        }
+        try validateAccountBackupInput(byteCount: 1024, accountCount: 10)
+
+        // T-ORPHAN-01：索引保存失败 → 补偿回滚本次新建的钥匙串项，不留幽灵账号
+        let blockedIndexDirectory = backupTraeDirectory.appendingPathComponent(
+            "blocked-index-dir",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: blockedIndexDirectory,
+            withIntermediateDirectories: false
+        )
+        let orphanStoreVault = FixtureTraeVault()
+        let orphanStore = TraeAccountStore(
+            indexURL: blockedIndexDirectory,
+            vault: orphanStoreVault,
+            controller: FixtureTraeApplicationController(
+                installedVariants: Set(TraeVariant.allCases),
+                runningVariants: [],
+                launchFailuresRemaining: 0
+            ),
+            storageURL: { variant in
+                variant == .china ? backupChinaStorageURL : backupWorkStorageURL
+            }
+        )
+        guard let chinaBackupRecord = exportEnvelope.accounts.first(
+            where: { $0.provider == .traeCN }
+        ) else {
+            throw SelfTestFailure(
+                message: "backup envelope must contain a Trae CN record",
+                file: #filePath,
+                line: #line
+            )
+        }
+        do {
+            try orphanStore.importSnapshot(
+                profile: chinaBackupRecord.metadata.traeProfile(variant: .china),
+                snapshot: try chinaBackupRecord.credential.traeSnapshot()
+            )
+            try expect(false, "index-save failure must surface as an import error")
+        } catch {
+            try expect(
+                orphanStoreVault.snapshots.isEmpty
+                    && orphanStoreVault.savedAccounts.isEmpty
+                    && orphanStore.accounts.isEmpty,
+                "failed import compensates the inserted Keychain item"
+            )
+        }
+
+        // T-GT-01 补充：校验失败文案存在（K 的次数）
+        try expect(
+            countSummary.failures.first?.contains("身份") == true,
+            "failed records carry a readable reason"
+        )
+
+        // T-CF-04：apply 返回 alreadyExists（TOCTOU duplicate）→ 计入跳过而非导入
+        let duplicateHandling = AccountBackupCore.importSummary(
+            records: [
+                BackupAccountRecord(
+                    provider: .traeWork,
+                    metadata: backupMetadata("t-user-2"),
+                    credential: .trae(workSnapshot)
+                )
+            ],
+            vaultStatus: { _ in false },
+            applyRecord: { _ in .alreadyExists }
+        )
+        try expect(
+            duplicateHandling.imported == 0
+                && duplicateHandling.skipped == 1
+                && duplicateHandling.failed == 0,
+            "apply-time duplicate is tallied as skipped"
+        )
+
+        // T-KDF-01：头部迭代次数解析与边界 + canonical 210k 兼容
+        let kdf210kFile = try AccountBackupFile.encryptedFile(
+            payloadJSON: backupPayloadJSON,
+            password: "correct-horse-1",
+            iterations: 210_000
+        )
+        let kdf210kDecrypted = try AccountBackupFile.decryptedPayload(
+            fileData: kdf210kFile,
+            password: "correct-horse-1"
+        )
+        try expect(
+            kdf210kDecrypted == backupPayloadJSON,
+            "canonical-minimum 210k v1 file still decrypts"
+        )
+        func withHeaderIterations(_ value: UInt32, in data: Data) -> Data {
+            var copy = data
+            let encoded = withUnsafeBytes(of: value.bigEndian) { Data($0) }
+            copy.replaceSubrange(10..<14, with: encoded)
+            return copy
+        }
+        for value: UInt32 in [209_999, 2_000_001] {
+            do {
+                _ = try AccountBackupFile.decryptedPayload(
+                    fileData: withHeaderIterations(value, in: backupFileA),
+                    password: "correct-horse-1"
+                )
+                try expect(false, "out-of-range iterations must be rejected")
+            } catch let error as AccountBackupFileError {
+                try expect(
+                    error == .malformed,
+                    "out-of-range iterations map to malformed"
+                )
+            }
+        }
+        do {
+            _ = try AccountBackupFile.decryptedPayload(
+                fileData: withHeaderIterations(2_000_000, in: backupFileA),
+                password: "correct-horse-1"
+            )
+            try expect(false, "tampered in-range iterations must fail auth")
+        } catch let error as AccountBackupFileError {
+            try expect(
+                error == .authenticationFailed,
+                "in-range iterations pass the range guard then fail auth"
+            )
+        }
+
         print("OpenUsage self-test passed: \(assertions) assertions")
     }
 }
@@ -2185,8 +2915,20 @@ private final class FixtureTraeVault: TraeCredentialVaulting, @unchecked Sendabl
         return snapshot
     }
 
+    func probeExistence(variant: TraeVariant, userID: String) throws -> Bool {
+        snapshots["\(variant.rawValue):\(userID)"] != nil
+    }
+
+    func insertIfAbsent(_ snapshot: TraeCredentialSnapshot) throws -> Bool {
+        guard snapshots[snapshot.keychainAccount] == nil else { return false }
+        snapshots[snapshot.keychainAccount] = snapshot
+        savedAccounts.insert(snapshot.keychainAccount)
+        return true
+    }
+
     func delete(variant: TraeVariant, userID: String) throws {
         snapshots.removeValue(forKey: "\(variant.rawValue):\(userID)")
+        savedAccounts.remove("\(variant.rawValue):\(userID)")
     }
 }
 

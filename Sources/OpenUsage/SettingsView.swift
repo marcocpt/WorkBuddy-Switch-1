@@ -1,5 +1,7 @@
+import AppKit
 import ServiceManagement
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct SettingsView: View {
     @ObservedObject var state: AppState
@@ -7,6 +9,11 @@ struct SettingsView: View {
     @AppStorage("autoCaptureCurrentAccount") private var autoCapture = false
     @AppStorage("refreshIntervalMinutes") private var refreshInterval = 10
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @State private var backupSheet: BackupSheet?
+    @State private var exportPassword = ""
+    @State private var exportConfirmPassword = ""
+    @State private var importPassword = ""
+    @State private var pendingImportURL: URL?
 
     init(state: AppState) {
         self.state = state
@@ -108,6 +115,21 @@ struct SettingsView: View {
                     }
                 }
 
+                settingsSection("账号数据") {
+                    backupActionRow(
+                        title: "导出全部账号",
+                        systemImage: "square.and.arrow.up",
+                        note: "将三端已保存的账号快照加密导出为文件",
+                        action: beginExport
+                    )
+                    backupActionRow(
+                        title: "导入账号",
+                        systemImage: "square.and.arrow.down",
+                        note: "从备份文件恢复账号，已存在的将跳过",
+                        action: beginImport
+                    )
+                }
+
                 settingsSection("隐私") {
                     Label(
                         "三个客户端的账号快照均存储在 macOS 钥匙串",
@@ -148,6 +170,170 @@ struct SettingsView: View {
                 dismissButton: .default(Text("好"))
             )
         }
+        .sheet(item: $backupSheet) { sheet in
+            switch sheet {
+            case .exportPassword:
+                exportPasswordSheet
+            case .importPassword:
+                importPasswordSheet
+            }
+        }
+    }
+
+    private var exportPasswordValid: Bool {
+        exportPassword.count >= 8 && exportPassword == exportConfirmPassword
+    }
+
+    private var exportPasswordSheet: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("导出全部账号")
+                .font(.system(size: 18, weight: .semibold))
+            Text(
+                "备份文件将加密保存。请设置一个密码（至少 8 位）并再次确认。\n密码无法找回，请妥善保管。"
+            )
+            .font(.system(size: 12))
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            SecureField("密码（至少 8 位）", text: $exportPassword)
+                .textFieldStyle(.roundedBorder)
+            SecureField("确认密码", text: $exportConfirmPassword)
+                .textFieldStyle(.roundedBorder)
+            if passwordNeedsCorrection {
+                Text(passwordHint)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.red)
+            }
+            HStack {
+                Spacer()
+                Button("取消") { backupSheet = nil }
+                Button("继续导出") { continueExport() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!exportPasswordValid)
+            }
+        }
+        .padding(24)
+        .frame(width: 440)
+    }
+
+    private var importPasswordSheet: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("导入账号")
+                .font(.system(size: 18, weight: .semibold))
+            Text("请输入备份文件的密码：")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+            SecureField("密码", text: $importPassword)
+                .textFieldStyle(.roundedBorder)
+            HStack {
+                Spacer()
+                Button("取消") { backupSheet = nil }
+                Button("导入") { confirmImport() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(importPassword.isEmpty)
+            }
+        }
+        .padding(24)
+        .frame(width: 440)
+    }
+
+    private var passwordNeedsCorrection: Bool {
+        (!exportPassword.isEmpty || !exportConfirmPassword.isEmpty) && !exportPasswordValid
+    }
+
+    private var passwordHint: String {
+        exportPassword.count < 8 ? "密码至少 8 位。" : "两次输入的密码不一致。"
+    }
+
+    @MainActor
+    private func beginExport() {
+        guard state.canStartAccountBackup else { return }
+        guard state.hasAnySavedAccount else {
+            state.alert = AppAlert(
+                title: "无法导出",
+                message: "当前没有已保存的账号，请先在各客户端登录并保存账号。"
+            )
+            return
+        }
+        exportPassword = ""
+        exportConfirmPassword = ""
+        backupSheet = .exportPassword
+    }
+
+    @MainActor
+    private func continueExport() {
+        let password = exportPassword
+        exportPassword = ""
+        exportConfirmPassword = ""
+        backupSheet = nil
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.workBuddySwitchBackup]
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        panel.nameFieldStringValue =
+            "WorkBuddy-Switch-账号备份-\(formatter.string(from: Date())).wbsacct"
+        panel.message = "备份文件使用导出密码加密，密码无法找回，请妥善保管。"
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task {
+            await state.exportAllAccounts(to: url, password: password)
+        }
+    }
+
+    @MainActor
+    private func beginImport() {
+        guard state.canStartAccountBackup else { return }
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.workBuddySwitchBackup, .data]
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else {
+            importPassword = ""
+            return
+        }
+        pendingImportURL = url
+        importPassword = ""
+        backupSheet = .importPassword
+    }
+
+    @MainActor
+    private func confirmImport() {
+        guard let url = pendingImportURL else { return }
+        let password = importPassword
+        importPassword = ""
+        pendingImportURL = nil
+        backupSheet = nil
+        Task {
+            await state.importAccounts(from: url, password: password)
+        }
+    }
+
+    private func backupActionRow(
+        title: String,
+        systemImage: String,
+        note: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        HStack(spacing: 12) {
+            Button(action: action) {
+                if state.isAccountBackupBusy {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Label(title, systemImage: systemImage)
+                }
+            }
+            .controlSize(.large)
+            .disabled(!state.canStartAccountBackup)
+            Spacer()
+            Text(note)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.trailing)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(title)，\(note)")
     }
 
     private var workBuddyApplicationURL: URL? {
@@ -198,5 +384,19 @@ struct SettingsView: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(title)，\(available ? "可用" : "不可用")，\(detail)")
+    }
+}
+
+private enum BackupSheet: String, Identifiable {
+    case exportPassword
+    case importPassword
+
+    var id: String { rawValue }
+}
+
+extension UTType {
+    /// WorkBuddy Switch 账号备份文件类型（加密容器）。
+    static var workBuddySwitchBackup: UTType {
+        UTType(exportedAs: "com.koi128bit.openusage.wbsacct", conformingTo: .data)
     }
 }

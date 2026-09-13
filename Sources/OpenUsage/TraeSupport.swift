@@ -516,6 +516,10 @@ protocol TraeCredentialVaulting {
     func save(_ snapshot: TraeCredentialSnapshot) throws
     func load(variant: TraeVariant, userID: String) throws -> TraeCredentialSnapshot
     func delete(variant: TraeVariant, userID: String) throws
+    /// 无副作用存在性探测（存在=true，不存在=false，其他错误抛出）。
+    func probeExistence(variant: TraeVariant, userID: String) throws -> Bool
+    /// 仅创建写入：已存在返回 false，新插入返回 true。
+    func insertIfAbsent(_ snapshot: TraeCredentialSnapshot) throws -> Bool
 }
 
 struct TraeCredentialVault: TraeCredentialVaulting {
@@ -590,6 +594,37 @@ struct TraeCredentialVault: TraeCredentialVaulting {
         let status = SecItemDelete(query as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw TraeSupportError.keychain(message(for: status))
+        }
+    }
+
+    func probeExistence(variant: TraeVariant, userID: String) throws -> Bool {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: "\(variant.rawValue):\(userID)"
+        ]
+        let status = SecItemCopyMatching(query as CFDictionary, nil)
+        switch status {
+        case errSecSuccess: return true
+        case errSecItemNotFound: return false
+        default: throw TraeSupportError.keychain(message(for: status))
+        }
+    }
+
+    func insertIfAbsent(_ snapshot: TraeCredentialSnapshot) throws -> Bool {
+        let data = try encoder.encode(snapshot)
+        let attributes: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: snapshot.keychainAccount,
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        ]
+        let status = SecItemAdd(attributes as CFDictionary, nil)
+        switch status {
+        case errSecSuccess: return true
+        case errSecDuplicateItem: return false
+        default: throw TraeSupportError.keychain(message(for: status))
         }
     }
 
@@ -863,6 +898,46 @@ final class TraeAccountStore: ObservableObject {
         try vault.delete(variant: profile.variant, userID: profile.userID)
         accounts.removeAll { $0.id == profile.id }
         try saveIndex()
+    }
+
+    /// 导出用：枚举全部索引账号并镜像钥匙串快照（缺失返回 snapshot=nil，不中断）。
+    func backupExportItems() -> [(profile: TraeAccountProfile, snapshot: TraeCredentialSnapshot?)] {
+        accounts.map { profile in
+            (profile, try? vault.load(variant: profile.variant, userID: profile.userID))
+        }
+    }
+
+    func hasSnapshot(variant: TraeVariant, userID: String) throws -> Bool {
+        try vault.probeExistence(variant: variant, userID: userID)
+    }
+
+    /// 导入用：仅创建写入 + 补偿事务。凭据身份校验通过后，若钥匙串已存在则跳过；
+    /// 索引保存失败时回滚本次新建的钥匙串项，避免幽灵账号。
+    @discardableResult
+    func importSnapshot(profile: TraeAccountProfile, snapshot: TraeCredentialSnapshot) throws -> BackupImportApplyResult {
+        try requireNoActiveSwitch()
+        guard snapshot.variant == profile.variant, snapshot.userID == profile.userID else {
+            throw TraeSupportError.snapshotIdentityMismatch
+        }
+        let previousAccounts = accounts
+        let inserted = try vault.insertIfAbsent(snapshot)
+        guard inserted else { return .alreadyExists }
+        if !accounts.contains(where: { $0.id == profile.id }) {
+            accounts.append(profile)
+            accounts.sort { $0.lastUsedAt > $1.lastUsedAt }
+        }
+        do {
+            try saveIndex()
+        } catch {
+            accounts = previousAccounts
+            guard (try? vault.delete(variant: profile.variant, userID: profile.userID)) != nil else {
+                throw TraeSupportError.requestFailed(
+                    "导入失败且回滚未完全成功：\(error.localizedDescription)"
+                )
+            }
+            throw error
+        }
+        return .inserted
     }
 
     func switchAccount(to profile: TraeAccountProfile) async throws {
