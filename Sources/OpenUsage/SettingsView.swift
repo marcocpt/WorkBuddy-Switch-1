@@ -9,11 +9,7 @@ struct SettingsView: View {
     @AppStorage("autoCaptureCurrentAccount") private var autoCapture = false
     @AppStorage("refreshIntervalMinutes") private var refreshInterval = 10
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
-    @State private var backupSheet: BackupSheet?
-    @State private var exportPassword = ""
-    @State private var exportConfirmPassword = ""
-    @State private var importPassword = ""
-    @State private var pendingImportURL: URL?
+    @State private var backupPasswordPanel: BackupPasswordPanel?
 
     init(state: AppState) {
         self.state = state
@@ -170,83 +166,11 @@ struct SettingsView: View {
                 dismissButton: .default(Text("好"))
             )
         }
-        .sheet(item: $backupSheet) { sheet in
-            switch sheet {
-            case .exportPassword:
-                exportPasswordSheet
-            case .importPassword:
-                importPasswordSheet
-            }
-        }
-    }
-
-    private var exportPasswordValid: Bool {
-        exportPassword.count >= 8 && exportPassword == exportConfirmPassword
-    }
-
-    private var exportPasswordSheet: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("导出全部账号")
-                .font(.system(size: 18, weight: .semibold))
-            Text(
-                "备份文件将加密保存。请设置一个密码（至少 8 位）并再次确认。\n密码无法找回，请妥善保管。"
-            )
-            .font(.system(size: 12))
-            .foregroundStyle(.secondary)
-            .fixedSize(horizontal: false, vertical: true)
-            SecureField("密码（至少 8 位）", text: $exportPassword)
-                .textFieldStyle(.roundedBorder)
-            SecureField("确认密码", text: $exportConfirmPassword)
-                .textFieldStyle(.roundedBorder)
-            if passwordNeedsCorrection {
-                Text(passwordHint)
-                    .font(.system(size: 11))
-                    .foregroundStyle(.red)
-            }
-            HStack {
-                Spacer()
-                Button("取消") { backupSheet = nil }
-                Button("继续导出") { continueExport() }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!exportPasswordValid)
-            }
-        }
-        .padding(24)
-        .frame(width: 440)
-    }
-
-    private var importPasswordSheet: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("导入账号")
-                .font(.system(size: 18, weight: .semibold))
-            Text("请输入备份文件的密码：")
-                .font(.system(size: 12))
-                .foregroundStyle(.secondary)
-            SecureField("密码", text: $importPassword)
-                .textFieldStyle(.roundedBorder)
-            HStack {
-                Spacer()
-                Button("取消") { backupSheet = nil }
-                Button("导入") { confirmImport() }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(importPassword.isEmpty)
-            }
-        }
-        .padding(24)
-        .frame(width: 440)
-    }
-
-    private var passwordNeedsCorrection: Bool {
-        (!exportPassword.isEmpty || !exportConfirmPassword.isEmpty) && !exportPasswordValid
-    }
-
-    private var passwordHint: String {
-        exportPassword.count < 8 ? "密码至少 8 位。" : "两次输入的密码不一致。"
     }
 
     @MainActor
     private func beginExport() {
-        guard state.canStartAccountBackup else { return }
+        guard state.canStartAccountBackup, backupPasswordPanel == nil else { return }
         guard state.hasAnySavedAccount else {
             state.alert = AppAlert(
                 title: "无法导出",
@@ -254,17 +178,20 @@ struct SettingsView: View {
             )
             return
         }
-        exportPassword = ""
-        exportConfirmPassword = ""
-        backupSheet = .exportPassword
+        // 独立可激活的 NSPanel（activation 门控 + 显式 first responder），
+        // 确保键盘焦点真正转移到密码框；presenter 由本视图强持有。
+        let presenter = BackupPasswordPanel()
+        backupPasswordPanel = presenter
+        presenter.presentExport { [weak presenter] password in
+            if backupPasswordPanel === presenter { backupPasswordPanel = nil }
+            continueExport(password: password)
+        } onCancel: { [weak presenter] in
+            if backupPasswordPanel === presenter { backupPasswordPanel = nil }
+        }
     }
 
     @MainActor
-    private func continueExport() {
-        let password = exportPassword
-        exportPassword = ""
-        exportConfirmPassword = ""
-        backupSheet = nil
+    private func continueExport(password: String) {
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.workBuddySwitchBackup]
         let formatter = DateFormatter()
@@ -281,30 +208,23 @@ struct SettingsView: View {
 
     @MainActor
     private func beginImport() {
-        guard state.canStartAccountBackup else { return }
+        guard state.canStartAccountBackup, backupPasswordPanel == nil else { return }
+        NSApp.activate(ignoringOtherApps: true)
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.workBuddySwitchBackup, .data]
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
-        guard panel.runModal() == .OK, let url = panel.url else {
-            importPassword = ""
-            return
-        }
-        pendingImportURL = url
-        importPassword = ""
-        backupSheet = .importPassword
-    }
-
-    @MainActor
-    private func confirmImport() {
-        guard let url = pendingImportURL else { return }
-        let password = importPassword
-        importPassword = ""
-        pendingImportURL = nil
-        backupSheet = nil
-        Task {
-            await state.importAccounts(from: url, password: password)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let presenter = BackupPasswordPanel()
+        backupPasswordPanel = presenter
+        presenter.presentImport { [weak presenter] password in
+            if backupPasswordPanel === presenter { backupPasswordPanel = nil }
+            Task {
+                await self.state.importAccounts(from: url, password: password)
+            }
+        } onCancel: { [weak presenter] in
+            if backupPasswordPanel === presenter { backupPasswordPanel = nil }
         }
     }
 
@@ -326,7 +246,7 @@ struct SettingsView: View {
                 .frame(minWidth: 150, alignment: .leading)
             }
             .controlSize(.large)
-            .disabled(!state.canStartAccountBackup || state.isAccountBackupBusy)
+            .disabled(!state.canStartAccountBackup || state.isAccountBackupBusy || backupPasswordPanel != nil)
             Spacer()
             Text(note)
                 .font(.system(size: 11))
@@ -385,13 +305,6 @@ struct SettingsView: View {
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(title)，\(available ? "可用" : "不可用")，\(detail)")
     }
-}
-
-private enum BackupSheet: String, Identifiable {
-    case exportPassword
-    case importPassword
-
-    var id: String { rawValue }
 }
 
 extension UTType {
