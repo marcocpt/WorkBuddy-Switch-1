@@ -518,6 +518,8 @@ enum TraeStorageCodec {
 protocol TraeCredentialVaulting {
     func save(_ snapshot: TraeCredentialSnapshot) throws
     func load(variant: TraeVariant, userID: String) throws -> TraeCredentialSnapshot
+    /// 单次批量读取 service 下全部快照，按 keychainAccount 映射（Keychain 锁定/需授权时只触发一次提示）。
+    func loadAll() throws -> [String: TraeCredentialSnapshot]
     func delete(variant: TraeVariant, userID: String) throws
     /// 无副作用存在性探测（存在=true，不存在=false，其他错误抛出）。
     func probeExistence(variant: TraeVariant, userID: String) throws -> Bool
@@ -589,6 +591,47 @@ struct TraeCredentialVault: TraeCredentialVaulting {
             throw TraeSupportError.snapshotIdentityMismatch
         }
         return snapshot
+    }
+
+    /// 单次批量读取 service 下全部快照，按 keychainAccount 映射；空字典表示无条目；故障抛错。
+    func loadAll() throws -> [String: TraeCredentialSnapshot] {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecReturnData as String: true,
+            kSecReturnAttributes as String: true,
+            // 用数字 limit：kSecMatchLimitAll 字符串与 kSecReturnData 组合在 macOS 13 返回 errSecParam(-50)。
+            kSecMatchLimit as String: 10_000
+        ]
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        switch status {
+        case errSecSuccess:
+            let items: [[String: Any]]
+            if let array = result as? [[String: Any]] {
+                items = array
+            } else if let single = result as? [String: Any] {
+                items = [single]
+            } else {
+                items = []
+            }
+            var map: [String: TraeCredentialSnapshot] = [:]
+            for item in items {
+                guard
+                    let account = item[kSecAttrAccount as String] as? String,
+                    let data = item[kSecValueData as String] as? Data,
+                    let snapshot = try? decoder.decode(TraeCredentialSnapshot.self, from: data)
+                else {
+                    continue
+                }
+                map[account] = snapshot
+            }
+            return map
+        case errSecItemNotFound:
+            return [:]
+        default:
+            throw TraeSupportError.keychain(message(for: status))
+        }
     }
 
     func delete(variant: TraeVariant, userID: String) throws {
@@ -975,10 +1018,17 @@ final class TraeAccountStore: ObservableObject {
     }
 
     /// 导出用：枚举全部索引账号并镜像钥匙串快照（缺失返回 snapshot=nil，不中断）。
+    /// 批量单次读取全部快照（profile.id 即 keychainAccount），Keychain 锁定/需授权时只触发一次提示。
     func backupExportItems() -> [(profile: TraeAccountProfile, snapshot: TraeCredentialSnapshot?)] {
-        accounts.map { profile in
-            (profile, try? vault.load(variant: profile.variant, userID: profile.userID))
+        let all = (try? vault.loadAll()) ?? [:]
+        return accounts.map { profile in
+            (profile, all[profile.id])
         }
+    }
+
+    /// 单次批量读取现有凭据 key（存在性判定用，一次 Keychain 访问）。
+    func existingAccountKeys() throws -> Set<String> {
+        try Set(vault.loadAll().keys)
     }
 
     func hasSnapshot(variant: TraeVariant, userID: String) throws -> Bool {
