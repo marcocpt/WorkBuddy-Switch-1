@@ -86,6 +86,7 @@ enum TraeSupportError: LocalizedError, Sendable {
     case snapshotIdentityMismatch
     case accountSnapshotMissing
     case unsafeAPIHost
+    case authenticationExpired
     case invalidUsageRows(Int)
     case inconsistentUsageTotal(expected: Int, received: Int)
     case usagePaginationLimitExceeded(Int)
@@ -117,6 +118,8 @@ enum TraeSupportError: LocalizedError, Sendable {
             return "该 Trae 账号没有可用的安全快照，请重新登录并保存。"
         case .unsafeAPIHost:
             return "Trae 登录信息中的服务地址不在官方安全列表内，已停止发送凭据。"
+        case .authenticationExpired:
+            return "Trae 登录已过期，请先打开对应 Trae 应用完成刷新后重试。"
         case .invalidUsageRows(let count):
             return "Trae 用量响应包含 \(count) 条无法识别的记录，未返回可能不完整的统计结果。"
         case .inconsistentUsageTotal(let expected, let received):
@@ -863,6 +866,22 @@ final class TraeAccountStore: ObservableObject {
             refreshed[variant] = result.snapshot.userID
         }
         currentUserIDs = refreshed
+    }
+
+    /// 直接读 storage.json 的当前账号身份（不修改缓存），
+    /// 供选凭据来源时对照真实磁盘状态，避免用陈旧的缓存决定走哪条路径。
+    func currentStorageUserID(for variant: TraeVariant) -> String? {
+        let url = storageURL(variant)
+        guard
+            let data = try? Data(contentsOf: url),
+            let result = try? TraeStorageCodec.readSnapshot(
+                from: data,
+                variant: variant
+            )
+        else {
+            return nil
+        }
+        return result.snapshot.userID
     }
 
     @discardableResult

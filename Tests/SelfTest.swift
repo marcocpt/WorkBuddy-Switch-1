@@ -1889,6 +1889,359 @@ enum OpenUsageSelfTest {
             "Trae usage revalidates the final response URL after redirects"
         )
 
+        let expiredAuth = try fixtureTraeAuth(
+            userID: "usage-service-user",
+            token: "expired-stale-token",
+            host: "api.trae.cn",
+            displayName: "Expired",
+            keyByte: 91
+        )
+        let expiredSnapshot = TraeCredentialSnapshot(
+            variant: .china,
+            userID: "usage-service-user",
+            authBlob: expiredAuth.blob,
+            userTagBlob: nil,
+            deviceAuthBlobs: [:],
+            capturedAt: capturedAt
+        )
+        let freshAuth = try fixtureTraeAuth(
+            userID: "usage-service-user",
+            token: "fresh-refreshed-token",
+            host: "api.trae.cn",
+            displayName: "Fresh",
+            keyByte: 92
+        )
+        let freshStorageFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "trae-storage-fresh-\(UUID().uuidString).json"
+            )
+        try TraeAtomicFile.write(
+            try fixtureTraeStorage(
+                authBlob: freshAuth.blob,
+                userTag: "fresh",
+                deviceSuffix: "fresh",
+                marker: "fresh"
+            ),
+            to: freshStorageFile,
+            preserving: nil
+        )
+        defer { try? FileManager.default.removeItem(at: freshStorageFile) }
+
+        let expiredRetryClient = FixtureTraeHTTPClient(
+            responses: [
+                FixtureTraeHTTPResponse(data: Data(), statusCode: 401),
+                FixtureTraeHTTPResponse(
+                    data: try fixtureTraeUsageResponse(
+                        total: 1,
+                        rows: [
+                            fixtureTraeUsageRow(
+                                id: "retried-row",
+                                timestamp: usageQueryStart + 10
+                            )
+                        ]
+                    )
+                )
+            ]
+        )
+        let expiredRetryService = TraeUsageService(
+            client: expiredRetryClient,
+            storageURL: { _ in freshStorageFile },
+            usagePageSize: 2,
+            authRetryDelayNanoseconds: 0
+        )
+        let retriedUsage = try await expiredRetryService.fetchUsage(
+            snapshot: expiredSnapshot,
+            range: usageQueryRange
+        )
+        let retriedRequests = await expiredRetryClient.capturedRequests()
+        try expect(
+            retriedUsage.scannedFiles == 1
+                && retriedRequests.count == 2
+                && retriedRequests[1].allHTTPHeaderFields?["Authorization"]
+                    == "Cloud-IDE-JWT fresh-refreshed-token",
+            "Trae usage falls back to fresh storage credentials after an expired-token 401"
+        )
+
+        let staleAuth = try fixtureTraeAuth(
+            userID: "usage-service-user",
+            token: "stale-expired-token",
+            host: "api.trae.cn",
+            displayName: "Stale",
+            keyByte: 93
+        )
+        let staleStorageFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "trae-storage-stale-\(UUID().uuidString).json"
+            )
+        try TraeAtomicFile.write(
+            try fixtureTraeStorage(
+                authBlob: staleAuth.blob,
+                userTag: "stale",
+                deviceSuffix: "stale",
+                marker: "stale"
+            ),
+            to: staleStorageFile,
+            preserving: nil
+        )
+        defer { try? FileManager.default.removeItem(at: staleStorageFile) }
+        let refreshedStorageData = try fixtureTraeStorage(
+            authBlob: freshAuth.blob,
+            userTag: "fresh",
+            deviceSuffix: "fresh",
+            marker: "fresh"
+        )
+        let staleRetryClient = FixtureTraeHTTPClient(
+            responses: [
+                FixtureTraeHTTPResponse(data: Data(), statusCode: 401),
+                FixtureTraeHTTPResponse(
+                    data: try fixtureTraeUsageResponse(
+                        total: 1,
+                        rows: [
+                            fixtureTraeUsageRow(
+                                id: "refreshed-row",
+                                timestamp: usageQueryStart + 10
+                            )
+                        ]
+                    )
+                )
+            ],
+            onFirstRequest: {
+                try? TraeAtomicFile.write(
+                    refreshedStorageData,
+                    to: staleStorageFile,
+                    preserving: nil
+                )
+            }
+        )
+        let staleRetryService = TraeUsageService(
+            client: staleRetryClient,
+            storageURL: { _ in staleStorageFile },
+            usagePageSize: 2,
+            authRetryDelayNanoseconds: 0
+        )
+        let refreshedUsage = try await staleRetryService.fetchUsage(
+            for: .china,
+            range: usageQueryRange
+        )
+        let refreshedRequests = await staleRetryClient.capturedRequests()
+        try expect(
+            refreshedUsage.scannedFiles == 1
+                && refreshedRequests.count == 2
+                && refreshedRequests[1].allHTTPHeaderFields?["Authorization"]
+                    == "Cloud-IDE-JWT fresh-refreshed-token",
+            "Trae usage rereads storage credentials and retries after an expired-token 401"
+        )
+
+        let otherUserAuth = try fixtureTraeAuth(
+            userID: "other-storage-user",
+            token: "other-user-token",
+            host: "api.trae.cn",
+            displayName: "Other",
+            keyByte: 94
+        )
+        let otherUserStorageFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "trae-storage-other-\(UUID().uuidString).json"
+            )
+        try TraeAtomicFile.write(
+            try fixtureTraeStorage(
+                authBlob: otherUserAuth.blob,
+                userTag: "other",
+                deviceSuffix: "other",
+                marker: "other"
+            ),
+            to: otherUserStorageFile,
+            preserving: nil
+        )
+        defer { try? FileManager.default.removeItem(at: otherUserStorageFile) }
+        let mismatchedClient = FixtureTraeHTTPClient(
+            responses: [
+                FixtureTraeHTTPResponse(data: Data(), statusCode: 401)
+            ]
+        )
+        let mismatchedService = TraeUsageService(
+            client: mismatchedClient,
+            storageURL: { _ in otherUserStorageFile },
+            usagePageSize: 2,
+            authRetryDelayNanoseconds: 0
+        )
+        var rejectedMismatchedFallback = false
+        do {
+            _ = try await mismatchedService.fetchUsage(
+                snapshot: expiredSnapshot,
+                range: usageQueryRange
+            )
+        } catch TraeSupportError.authenticationExpired {
+            rejectedMismatchedFallback = true
+        }
+        let mismatchedRequests = await mismatchedClient.capturedRequests()
+        try expect(
+            rejectedMismatchedFallback && mismatchedRequests.count == 1,
+            "Trae usage never falls back to a different storage account on expired token"
+        )
+
+        let reportQuotaData = Data(
+            """
+            {
+              "data": {
+                "entitlements": [
+                  {
+                    "entitlement_base_info": {
+                      "user_id": "usage-service-user",
+                      "product_type": 1,
+                      "start_time": 1784822400,
+                      "end_time": 1787500800,
+                      "quota": {
+                        "basic_usage_limit": 100,
+                        "bonus_usage_limit": 20
+                      }
+                    },
+                    "usage": {
+                      "basic_usage_amount": 30,
+                      "bonus_usage_amount": 5,
+                      "pay_go_amount": 2
+                    },
+                    "next_billing_time": 1787500800
+                  }
+                ]
+              }
+            }
+            """.utf8
+        )
+        let reportRetryClient = FixtureTraeHTTPClient(
+            pathResponses: [
+                "usage": [
+                    FixtureTraeHTTPResponse(data: Data(), statusCode: 401),
+                    FixtureTraeHTTPResponse(
+                        data: try fixtureTraeUsageResponse(
+                            total: 1,
+                            rows: [
+                                fixtureTraeUsageRow(
+                                    id: "report-retried-row",
+                                    timestamp: usageQueryStart + 10
+                                )
+                            ]
+                        )
+                    )
+                ],
+                "quota": [
+                    FixtureTraeHTTPResponse(data: Data(), statusCode: 401),
+                    FixtureTraeHTTPResponse(data: reportQuotaData)
+                ]
+            ]
+        )
+        let reportRetryService = TraeUsageService(
+            client: reportRetryClient,
+            storageURL: { _ in freshStorageFile },
+            usagePageSize: 2,
+            authRetryDelayNanoseconds: 0
+        )
+        let retriedReport = try await reportRetryService.fetchReport(
+            snapshot: expiredSnapshot,
+            range: usageQueryRange
+        )
+        let reportRequests = await reportRetryClient.capturedRequests()
+        let usageRequests = reportRequests.filter {
+            $0.url?.path.contains("query_user_usage") == true
+        }
+        let quotaRequests = reportRequests.filter {
+            $0.url?.path.contains("ide_user_ent_usage") == true
+        }
+        try expect(
+            retriedReport.usage.scannedFiles == 1
+                && retriedReport.quota.sourceUserID == "usage-service-user"
+                && usageRequests.count == 2
+                && quotaRequests.count == 2
+                && usageRequests[1].allHTTPHeaderFields?["Authorization"]
+                    == "Cloud-IDE-JWT fresh-refreshed-token"
+                && quotaRequests[1].allHTTPHeaderFields?["Authorization"]
+                    == "Cloud-IDE-JWT fresh-refreshed-token",
+            "Trae report retries usage and quota together with fresh storage credentials"
+        )
+
+        let forbiddenClient = FixtureTraeHTTPClient(
+            pathResponses: [
+                "usage": [
+                    FixtureTraeHTTPResponse(data: Data(), statusCode: 403),
+                    FixtureTraeHTTPResponse(data: Data(), statusCode: 403)
+                ]
+            ]
+        )
+        let forbiddenService = TraeUsageService(
+            client: forbiddenClient,
+            storageURL: { _ in freshStorageFile },
+            usagePageSize: 2,
+            authRetryDelayNanoseconds: 0,
+            maxAuthRetries: 1
+        )
+        var rejectedForbidden = false
+        do {
+            _ = try await forbiddenService.fetchUsage(
+                for: .china,
+                range: usageQueryRange
+            )
+        } catch TraeSupportError.authenticationExpired {
+            rejectedForbidden = true
+        }
+        try expect(
+            rejectedForbidden,
+            "Trae usage maps 403 to authenticationExpired and retries within budget"
+        )
+
+        let exhaustedClient = FixtureTraeHTTPClient(
+            pathResponses: [
+                "usage": [
+                    FixtureTraeHTTPResponse(data: Data(), statusCode: 401),
+                    FixtureTraeHTTPResponse(data: Data(), statusCode: 401),
+                    FixtureTraeHTTPResponse(data: Data(), statusCode: 401)
+                ]
+            ]
+        )
+        let exhaustedService = TraeUsageService(
+            client: exhaustedClient,
+            storageURL: { _ in freshStorageFile },
+            usagePageSize: 2,
+            authRetryDelayNanoseconds: 0,
+            maxAuthRetries: 2
+        )
+        var rejectedExhausted = false
+        do {
+            _ = try await exhaustedService.fetchUsage(
+                for: .china,
+                range: usageQueryRange
+            )
+        } catch TraeSupportError.authenticationExpired {
+            rejectedExhausted = true
+        }
+        let exhaustedRequests = await exhaustedClient.capturedRequests()
+        try expect(
+            rejectedExhausted && exhaustedRequests.count == 3,
+            "Trae usage stops retrying after the auth retry budget is exhausted"
+        )
+
+        let mismatchedTargetClient = FixtureTraeHTTPClient(responses: [])
+        let mismatchedTargetService = TraeUsageService(
+            client: mismatchedTargetClient,
+            storageURL: { _ in freshStorageFile },
+            usagePageSize: 2
+        )
+        var rejectedTargetMismatch = false
+        do {
+            _ = try await mismatchedTargetService.fetchUsage(
+                for: .china,
+                range: usageQueryRange,
+                targetUserID: "some-other-target-user"
+            )
+        } catch TraeSupportError.authenticationExpired {
+            rejectedTargetMismatch = true
+        }
+        let mismatchedTargetRequests = await mismatchedTargetClient
+            .capturedRequests()
+        try expect(
+            rejectedTargetMismatch && mismatchedTargetRequests.isEmpty,
+            "Trae usage rejects a request whose target account differs from the storage identity"
+        )
+
         let traeQuotaData = Data(
             """
             {
@@ -2772,20 +3125,51 @@ private enum FixtureTraeHTTPError: Error {
 
 private actor FixtureTraeHTTPClient: TraeHTTPClient {
     private var responses: [FixtureTraeHTTPResponse]
+    private var pathResponses: [String: [FixtureTraeHTTPResponse]]?
     private var requests: [URLRequest] = []
+    private var onFirstRequest: (@Sendable () -> Void)?
 
-    init(responses: [FixtureTraeHTTPResponse]) {
+    init(
+        responses: [FixtureTraeHTTPResponse],
+        onFirstRequest: (@Sendable () -> Void)? = nil
+    ) {
         self.responses = responses
+        self.onFirstRequest = onFirstRequest
+    }
+
+    init(
+        pathResponses: [String: [FixtureTraeHTTPResponse]],
+        onFirstRequest: (@Sendable () -> Void)? = nil
+    ) {
+        self.responses = []
+        self.pathResponses = pathResponses
+        self.onFirstRequest = onFirstRequest
     }
 
     func data(
         for request: URLRequest
     ) async throws -> (Data, HTTPURLResponse) {
-        requests.append(request)
-        guard !responses.isEmpty else {
-            throw FixtureTraeHTTPError.missingResponse
+        if requests.isEmpty, let onFirstRequest {
+            onFirstRequest()
         }
-        let fixture = responses.removeFirst()
+        requests.append(request)
+        let fixture: FixtureTraeHTTPResponse
+        if let pathResponses {
+            let path = request.url?.path ?? ""
+            let key = path.contains("ide_user_ent_usage")
+                ? "quota"
+                : (path.contains("query_user_usage") ? "usage" : "unknown")
+            guard var queue = pathResponses[key], !queue.isEmpty else {
+                throw FixtureTraeHTTPError.missingResponse
+            }
+            fixture = queue.removeFirst()
+            self.pathResponses?[key] = queue
+        } else {
+            guard !responses.isEmpty else {
+                throw FixtureTraeHTTPError.missingResponse
+            }
+            fixture = responses.removeFirst()
+        }
         guard
             let responseURL = fixture.responseURL ?? request.url,
             let response = HTTPURLResponse(

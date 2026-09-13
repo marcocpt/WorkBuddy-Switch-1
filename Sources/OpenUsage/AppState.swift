@@ -913,7 +913,12 @@ final class AppState: ObservableObject {
             traeQuota = nil
             locallyAttributedCycleCredits = nil
             if force {
-                present(error, title: "\(provider.title) 用量读取失败")
+                // 登录过期已在服务层自动重试过；仍失败时用内联提示替代
+                // 弹窗，避免切换账号时被模态错误打断。
+                guard case TraeSupportError.authenticationExpired = error else {
+                    present(error, title: "\(provider.title) 用量读取失败")
+                    return
+                }
             }
         }
     }
@@ -998,7 +1003,8 @@ final class AppState: ObservableObject {
         }
         return try await traeUsageService.fetchReport(
             for: variant,
-            range: range
+            range: range,
+            targetUserID: usageAccountID
         )
     }
 
@@ -1014,7 +1020,8 @@ final class AppState: ObservableObject {
         }
         return try await traeUsageService.fetchUsage(
             for: variant,
-            range: range
+            range: range,
+            targetUserID: usageAccountID
         )
     }
 
@@ -1022,6 +1029,13 @@ final class AppState: ObservableObject {
         variant: TraeVariant
     ) throws -> TraeCredentialSnapshot? {
         guard let accountID = usageAccountID else { return nil }
+        // 当前 storage.json 的凭据由 Trae 应用维护并随登录自动刷新，
+        // 优先使用它，避免拿钥匙串里可能过期的快照 token 触发 401。
+        // 用真实磁盘身份（而非可能陈旧的缓存）判断，防止缓存与磁盘
+        // 不同步时把别的账号数据标到目标账号头上。
+        if traeAccounts.currentStorageUserID(for: variant) == accountID {
+            return nil
+        }
         if traeAccounts.accounts(for: variant).contains(
             where: { $0.userID == accountID }
         ) {
@@ -1029,9 +1043,6 @@ final class AppState: ObservableObject {
                 for: variant,
                 userID: accountID
             )
-        }
-        if traeAccounts.currentUserID(for: variant) == accountID {
-            return nil
         }
         throw TraeSupportError.accountSnapshotMissing
     }
