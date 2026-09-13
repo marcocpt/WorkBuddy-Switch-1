@@ -198,6 +198,8 @@ actor TraeUsageService {
     private let storageURL: @Sendable (TraeVariant) -> URL
     private let usagePageSize: Int
     private let paginationPageLimit: Int
+    private let authRetryDelayNanoseconds: UInt64
+    private let maxAuthRetries: Int
 
     init(
         client: any TraeHTTPClient = URLSessionTraeHTTPClient(),
@@ -205,41 +207,60 @@ actor TraeUsageService {
             TraeDataLocation.resolve($0).storageURL
         },
         usagePageSize: Int = 100,
-        paginationPageLimit: Int = 100
+        paginationPageLimit: Int = 100,
+        authRetryDelayNanoseconds: UInt64 = 4_000_000_000,
+        maxAuthRetries: Int = 2
     ) {
         self.client = client
         self.storageURL = storageURL
         self.usagePageSize = max(1, usagePageSize)
         self.paginationPageLimit = max(1, paginationPageLimit)
+        self.authRetryDelayNanoseconds = authRetryDelayNanoseconds
+        self.maxAuthRetries = max(0, maxAuthRetries)
     }
 
     func fetchReport(
         for variant: TraeVariant,
-        range: UsageDateRange
+        range: UsageDateRange,
+        targetUserID: String? = nil
     ) async throws -> TraeUsageReport {
         let credentials = try currentCredentials(for: variant)
-        async let usage = fetchUsage(
-            payload: credentials.payload,
+        if let targetUserID, credentials.payload.userID != targetUserID {
+            throw TraeSupportError.authenticationExpired
+        }
+        return try await withAuthRetry(
             variant: variant,
-            range: range
-        )
-        async let quota = fetchQuota(
-            payload: credentials.payload,
-            variant: variant
-        )
-        return try await TraeUsageReport(usage: usage, quota: quota)
+            initial: credentials.payload,
+            expectedUserID: targetUserID ?? credentials.payload.userID
+        ) { payload in
+            try await self.fetchReportOnce(
+                payload: payload,
+                variant: variant,
+                range: range
+            )
+        }
     }
 
     func fetchUsage(
         for variant: TraeVariant,
-        range: UsageDateRange
+        range: UsageDateRange,
+        targetUserID: String? = nil
     ) async throws -> UsageSnapshot {
         let credentials = try currentCredentials(for: variant)
-        return try await fetchUsage(
-            payload: credentials.payload,
+        if let targetUserID, credentials.payload.userID != targetUserID {
+            throw TraeSupportError.authenticationExpired
+        }
+        return try await withAuthRetry(
             variant: variant,
-            range: range
-        )
+            initial: credentials.payload,
+            expectedUserID: targetUserID ?? credentials.payload.userID
+        ) { payload in
+            try await self.fetchUsage(
+                payload: payload,
+                variant: variant,
+                range: range
+            )
+        }
     }
 
     func fetchUsage(
@@ -247,19 +268,31 @@ actor TraeUsageService {
         range: UsageDateRange
     ) async throws -> UsageSnapshot {
         let payload = try verifiedPayload(snapshot)
-        return try await fetchUsage(
-            payload: payload,
+        return try await withAuthRetry(
             variant: snapshot.variant,
-            range: range
-        )
+            initial: payload,
+            expectedUserID: snapshot.userID
+        ) { payload in
+            try await self.fetchUsage(
+                payload: payload,
+                variant: snapshot.variant,
+                range: range
+            )
+        }
     }
 
     func fetchQuota(for variant: TraeVariant) async throws -> TraeQuotaSummary {
         let credentials = try currentCredentials(for: variant)
-        return try await fetchQuota(
-            payload: credentials.payload,
-            variant: variant
-        )
+        return try await withAuthRetry(
+            variant: variant,
+            initial: credentials.payload,
+            expectedUserID: credentials.payload.userID
+        ) { payload in
+            try await self.fetchQuota(
+                payload: payload,
+                variant: variant
+            )
+        }
     }
 
     func fetchReport(
@@ -267,16 +300,73 @@ actor TraeUsageService {
         range: UsageDateRange
     ) async throws -> TraeUsageReport {
         let payload = try verifiedPayload(snapshot)
+        return try await withAuthRetry(
+            variant: snapshot.variant,
+            initial: payload,
+            expectedUserID: snapshot.userID
+        ) { payload in
+            try await self.fetchReportOnce(
+                payload: payload,
+                variant: snapshot.variant,
+                range: range
+            )
+        }
+    }
+
+    private func fetchReportOnce(
+        payload: TraeAuthPayload,
+        variant: TraeVariant,
+        range: UsageDateRange
+    ) async throws -> TraeUsageReport {
         async let usage = fetchUsage(
             payload: payload,
-            variant: snapshot.variant,
+            variant: variant,
             range: range
         )
         async let quota = fetchQuota(
             payload: payload,
-            variant: snapshot.variant
+            variant: variant
         )
         return try await TraeUsageReport(usage: usage, quota: quota)
+    }
+
+    /// 401/403（登录过期）时等待 Trae 应用刷新 token 并写回 storage.json，
+    /// 然后重读最新凭据自动重试；快照路径失败时同样回退到当前 storage.json
+    /// 凭据。达到重试上限后原样抛出，由调用方决定提示方式。
+    private func withAuthRetry<T: Sendable>(
+        variant: TraeVariant,
+        initial: TraeAuthPayload,
+        expectedUserID: String? = nil,
+        operation: (TraeAuthPayload) async throws -> T
+    ) async throws -> T {
+        var payload = initial
+        var retries = 0
+        while true {
+            do {
+                return try await operation(payload)
+            } catch TraeSupportError.authenticationExpired {
+                guard retries < maxAuthRetries else {
+                    throw TraeSupportError.authenticationExpired
+                }
+                retries += 1
+                if authRetryDelayNanoseconds > 0 {
+                    try await Task.sleep(nanoseconds: authRetryDelayNanoseconds)
+                }
+                // storage.json 可能正被 Trae 原子替换（瞬时缺失/解析失败），
+                // 视为刷新尚未完成：本轮不换凭据，循环自然进入下一轮重试。
+                if let refreshed = try? currentCredentials(for: variant) {
+                    // 只有 storage.json 当前仍是目标账号时才回退使用，
+                    // 避免把其他账号的凭据/用量误标到目标账号头上。
+                    guard
+                        expectedUserID == nil
+                            || refreshed.payload.userID == expectedUserID
+                    else {
+                        throw TraeSupportError.authenticationExpired
+                    }
+                    payload = refreshed.payload
+                }
+            }
+        }
     }
 
     private func currentCredentials(
@@ -473,9 +563,7 @@ actor TraeUsageService {
                 return data
             }
             if response.statusCode == 401 || response.statusCode == 403 {
-                throw TraeSupportError.requestFailed(
-                    "Trae 登录已过期，请先打开对应 Trae 应用完成刷新后重试。"
-                )
+                throw TraeSupportError.authenticationExpired
             }
             lastStatus = response.statusCode
             let canFallback = [400, 404, 405].contains(response.statusCode)
