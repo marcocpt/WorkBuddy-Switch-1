@@ -115,21 +115,6 @@ struct SettingsView: View {
                     }
                 }
 
-                settingsSection("账号数据") {
-                    backupActionRow(
-                        title: "导出全部账号",
-                        systemImage: "square.and.arrow.up",
-                        note: "将三端已保存的账号快照加密导出为文件",
-                        action: beginExport
-                    )
-                    backupActionRow(
-                        title: "导入账号",
-                        systemImage: "square.and.arrow.down",
-                        note: "从备份文件恢复账号，已存在的将跳过",
-                        action: beginImport
-                    )
-                }
-
                 settingsSection("隐私") {
                     Label(
                         "三个客户端的账号快照均存储在 macOS 钥匙串",
@@ -142,6 +127,21 @@ struct SettingsView: View {
                     Label(
                         "Trae 切号不会删除设置、插件、工作区或对话",
                         systemImage: "checkmark.shield"
+                    )
+                }
+
+                settingsSection("账号数据") {
+                    backupActionRow(
+                        title: "导出全部账号",
+                        systemImage: "square.and.arrow.up",
+                        note: "将三端已保存的账号快照加密导出为文件",
+                        action: beginExport
+                    )
+                    backupActionRow(
+                        title: "导入账号",
+                        systemImage: "square.and.arrow.down",
+                        note: "从备份文件恢复账号，已存在的将跳过",
+                        action: beginImport
                     )
                 }
 
@@ -316,15 +316,17 @@ struct SettingsView: View {
     ) -> some View {
         HStack(spacing: 12) {
             Button(action: action) {
-                if state.isAccountBackupBusy {
-                    ProgressView()
-                        .controlSize(.small)
-                } else {
+                HStack(spacing: 8) {
+                    if state.isAccountBackupBusy {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
                     Label(title, systemImage: systemImage)
                 }
+                .frame(minWidth: 150, alignment: .leading)
             }
             .controlSize(.large)
-            .disabled(!state.canStartAccountBackup)
+            .disabled(!state.canStartAccountBackup || state.isAccountBackupBusy)
             Spacer()
             Text(note)
                 .font(.system(size: 11))
@@ -332,8 +334,6 @@ struct SettingsView: View {
                 .multilineTextAlignment(.trailing)
                 .fixedSize(horizontal: false, vertical: true)
         }
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(title)，\(note)")
     }
 
     private var workBuddyApplicationURL: URL? {

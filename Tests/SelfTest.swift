@@ -2705,6 +2705,22 @@ enum OpenUsageSelfTest {
                 )
             }
         }
+        // 加密侧 guard 负例（同范围内的值不得生成自相矛盾的文件）
+        for value: UInt32 in [209_999, 2_000_001] {
+            do {
+                _ = try AccountBackupFile.encryptedFile(
+                    payloadJSON: backupPayloadJSON,
+                    password: "correct-horse-1",
+                    iterations: value
+                )
+                try expect(false, "encryption with out-of-range iterations must be rejected")
+            } catch let error as AccountBackupFileError {
+                try expect(
+                    error == .malformed,
+                    "encryption-side out-of-range iterations map to malformed"
+                )
+            }
+        }
         do {
             _ = try AccountBackupFile.decryptedPayload(
                 fileData: withHeaderIterations(2_000_000, in: backupFileA),

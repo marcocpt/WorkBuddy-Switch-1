@@ -564,7 +564,7 @@ final class AppState: ObservableObject {
                 )
             }.value
             try writeSecureBackupFile(sealed, to: url)
-            var message = "已导出 \(built.summary.totalExported) 个账号到所选文件。"
+            var message = "已导出 \(built.summary.totalExported) 个账号。\n保存位置：\(url.path)"
             if built.summary.skippedWithoutSnapshot > 0 {
                 message += "\n跳过 \(built.summary.skippedWithoutSnapshot) 个缺少凭据快照的账号，请重新登录并保存后再导出。"
             }
