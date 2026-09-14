@@ -1,7 +1,7 @@
 # 测试用例表：概览页积分统计卡片
 
-- 版本：v1（未批准草图，等待自检后定版）
-- 上游：requirements.md v1 + design.md v1（同版本族）
+- 版本：v2
+- 上游：requirements.md v2 + design.md v2（同版本族）
 - 执行位置：`scripts/test.sh`（swiftc 自测二进制，本地仅单元；UI 无 XCUITest，见 UI 段）
 
 ---
@@ -28,11 +28,15 @@
 | T-TR-02 | FR-3 | Trae unlimited（total=nil） | unit=unlimited、totalRemaining=nil、显示「不限量」前置条件 |
 | T-TR-03 | FR-3 | Trae requests 单位 | unit=requests、totalRemaining=请求剩余 |
 | T-TR-04 | FR-4 | Trae resetsAt 在 7 天内 → expiringSoon=true | 边界断言 |
-| T-SR-01 | FR-2/§11 | 排序：WorkBuddy（lastUsedAt 倒序）→ Trae CN → TRAE Work | 输出顺序断言 |
+| T-SR-01 | FR-2/FR-15 | 排序分组：WorkBuddy → Trae CN → TRAE Work，组内按最近到期升序 | 输出顺序断言、provider 分组断言 |
+| T-SR-02 | FR-15 | 列内到期排序：有到期日（升序）→ 无到期日 → 失败卡 | 同 provider 内 accountID 顺序断言 |
+| T-SR-03 | FR-15 | 排序键优先取最早的有效包到期日（Trae 结算日仅作回落）；已到期/已用尽的包不成为排序键 | `orderingExpiry` 断言 + 跨卡比较断言 |
+| T-COL-01 | FR-14 | 按客户端分列：列序与 provider 一致、空 provider 不出列 | `columns` 输出断言 |
 | T-ISO-01 | FR-8 | 混合结果：1 账号 error + 2 账号正常 | 仅该卡片 error，其余 totalRemaining 正常 |
 | T-RACE-01 | FR-10 | 服务层返回后按代际丢弃 | 由 AppState 层测试/代码评审覆盖（UI 集成，见 §3） |
 | T-PKG-01 | FR-13 | WorkBuddy 资源包 → 展示明细：名称回退、剩余/总量/已用、到期与 7 天/已到期状态 | 断言映射后的 CreditPackage 数值与标志 |
 | T-PKG-02 | FR-13 | Trae 多权益包解析与映射：每包剩余 = limit-used，展示名、毫秒级到期 | parseQuota.packs + 卡片 packages 断言 |
+| T-PKG-03 | FR-13/FR-15 | 包明细顺序：有效包（到期升序）→ 已到期/已用尽 → 无到期日；预览 = 同一顺序前段 | `CreditPackageOrdering.sorted/upcoming` 输出断言 |
 
 ## 3. 集成与 UI 证据
 
@@ -45,6 +49,7 @@
 | UI-03 | AC-5 | 刷新按钮 → 加载态 → 更新 | 操作录像/截图 |
 | UI-04 | AC-6 | 单账号过期/失败 → 该卡红字内联，其余正常 | 构造过期账号 + 截图 |
 | UI-05 | AC-8 | 刷新后无 token 出现在日志/索引/设置 | 日志与文件抽查 |
+| UI-06 | AC-11/AC-12 | 三列布局与列内升序：每列列头显示 app 名与卡数；三列各自第一张卡的到期日不晚于同列其余卡片 | 真实 .app 截图（含三端各多账号） |
 
 说明：本地禁止 XCUITest（用户规则）；UI AC 以真实运行的 .app 手动验证 + 截图取证（沿用既有 evidence 目录约定）。UI 证据需真实界面，不接受 mock 层数断言替代。
 
@@ -58,3 +63,4 @@
 | 版本 | 日期 | 说明 |
 |---|---|---|
 | v1 | 2026-09-14 | 初稿；NFR-2 随 requirements v1 修订同步。T-PR-08 语义修订为「无法识别→失败」，补充 H-02/H-03/M-01 回归；增量：新增 T-PKG-01/02（全部积分包明细） |
+| v2 | 2026-09-15 | T-SR-01 语义更新为「provider 分组 + 组内到期升序」；新增 T-SR-02 / T-SR-03 / T-COL-01 / T-PKG-03 与 UI-06（三列 + 列内升序截图证据） |

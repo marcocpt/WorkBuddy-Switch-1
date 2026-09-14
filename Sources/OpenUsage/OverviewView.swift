@@ -74,20 +74,21 @@ struct OverviewView: View {
             }
             .padding(.bottom, 10)
             if state.isCreditStatsLoading && state.creditStats.isEmpty {
-                LazyVGrid(
-                    columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 4),
-                    spacing: 12
-                ) {
-                    ForEach(0..<2, id: \.self) { _ in
-                        creditSkeletonCard
-                    }
-                }
+                creditSkeletonColumns
             } else {
-                LazyVGrid(
-                    columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 4),
-                    spacing: 12
-                ) {
-                    ForEach(state.creditStats) { stat in
+                creditColumns
+            }
+        }
+        .padding(.top, 18)
+    }
+
+    /// 每个 app 一列（WorkBuddy / Trae CN / TRAE Work），列内卡片按最近到期日升序。
+    private var creditColumns: some View {
+        HStack(alignment: .top, spacing: 12) {
+            ForEach(CreditStatMapper.columns(state.creditStats)) { column in
+                VStack(alignment: .leading, spacing: 10) {
+                    creditColumnHeader(column.provider, count: column.stats.count)
+                    ForEach(column.stats) { stat in
                         CreditStatCard(
                             stat: stat,
                             onSwitchAccount: { switchAccount(stat) },
@@ -97,9 +98,50 @@ struct OverviewView: View {
                         )
                     }
                 }
+                .frame(maxWidth: .infinity, alignment: .topLeading)
             }
         }
-        .padding(.top, 18)
+    }
+
+    /// 首次加载尚未拿到数据时，按「有已保存账号的 app」铺骨架列。
+    private var creditSkeletonColumns: some View {
+        HStack(alignment: .top, spacing: 12) {
+            ForEach(providersWithSavedAccounts, id: \.self) { provider in
+                VStack(alignment: .leading, spacing: 10) {
+                    creditColumnHeader(provider, count: nil)
+                    creditSkeletonCard
+                }
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+            }
+        }
+    }
+
+    private func creditColumnHeader(_ provider: ManagedProvider, count: Int?) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: provider.systemImage)
+                .font(.system(size: 11, weight: .semibold))
+            Text(provider.title)
+                .font(.system(size: 12, weight: .semibold))
+            if let count {
+                Text("\(count)")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+            }
+            Spacer(minLength: 0)
+        }
+        .foregroundStyle(.secondary)
+    }
+
+    /// 拥有已保存账号的 app（首次加载铺骨架时用），顺序与列顺序一致。
+    private var providersWithSavedAccounts: [ManagedProvider] {
+        var result: [ManagedProvider] = []
+        if !accounts.accounts.isEmpty {
+            result.append(.workBuddy)
+        }
+        for variant in TraeVariant.allCases where !traeAccounts.accounts(for: variant).isEmpty {
+            result.append(variant.provider)
+        }
+        return result
     }
 
     /// 点击积分卡图标：把该卡片账号切换为当前激活账号（当前账号禁用）。
@@ -808,23 +850,16 @@ private struct CreditStatCard: View {
         .popover(isPresented: $showPackagesDetail, arrowEdge: .top) {
             PackageListDetailView(
                 accountName: stat.accountName.isEmpty ? accountShortID : stat.accountName,
-                packages: stat.packages
+                packages: CreditPackageOrdering.sorted(stat.packages)
             )
         }
     }
 
     // MARK: - 计算属性
 
-    /// 按「到期日升序」排序的即将到期包列表：剩余>0 且 未过期 且 有到期日
+    /// 即将到期包列表：与「查看全部积分包」同一套顺序的前段（剩余>0、未过期、有到期日）
     private var upcomingExpiryPackages: [CreditPackage] {
-        stat.packages
-            .filter { $0.remaining > 0 && !$0.expired }
-            .compactMap { pkg -> (CreditPackage, Date)? in
-                guard let expireAt = pkg.expireAt else { return nil }
-                return (pkg, expireAt)
-            }
-            .sorted { $0.1 < $1.1 }
-            .map(\.0)
+        CreditPackageOrdering.upcoming(stat.packages)
     }
 
     private var accountShortID: String {

@@ -1,8 +1,8 @@
 # 设计规格：概览页积分统计卡片
 
-- 版本：v1（未批准草图，等待自检后定版）
-- 上游：requirements.md v1（本目录同版本族）
-- 范围引用：FR-1 ~ FR-11，NFR-1 ~ NFR-6
+- 版本：v2
+- 上游：requirements.md v2（本目录同版本族）
+- 范围引用：FR-1 ~ FR-15，NFR-1 ~ NFR-6
 
 ---
 
@@ -17,7 +17,11 @@
   - `AccountCreditStat`（视图模型）：provider（ManagedProvider）、accountID、accountName、isCurrent、unit（credits/requests/unlimited）、totalRemaining(Double?)、expiringSoonRemaining(Double)、soonestExpireAt(Date?)、error(String?)、isLoading(由界面层持有)。
 - WorkBuddy 资源解析（纯函数）：入参为 billing 接口 JSON（`data.Response.Data.Accounts[]` 或等效路径），输出 `[CreditResource]`。字段取 precision 优先、fallback 次之；到期时间支持 毫秒/秒/ISO8601/`yyyy-MM-dd HH:mm:ss`/`yyyy-MM-dd`；`expiringSoon` = 剩余>0 且 now < expireAt ≤ now+7d；`expired` = expireAt ≤ now 且剩余>0。
 - Trae 映射（纯函数）：入参 `TraeQuotaSummary`，输出 `AccountCreditStat`。Credits 单位 → unit=credits、totalRemaining=remaining；请求单位 → unit=requests、totalRemaining=remaining；total=nil → unit=unlimited、totalRemaining=nil；soonestExpireAt=resetsAt；expiringSoon= resetsAt ≤ now+7d（仅 remaining>0 或 unlimited 时计）。
-- 排序（纯函数）：WorkBuddy 账号（按 lastUsedAt 倒序）→ Trae CN 账号 → TRAE Work 账号；组内保持传入顺序。
+- 排序（纯函数）：
+  - `CreditStatMapper.orderingExpiry(stat)`：卡片排序键 = 该卡片中「仍有剩余且未到期」的积分包里最早的 `expireAt`；无此类带日期的包时回落到 `stat.soonestExpireAt`（Trae 的下次结算日走此回落）。
+  - `CreditStatMapper.sort`：provider 分组（WorkBuddy → Trae CN → TRAE Work）→ 组内按 `orderingExpiry` 升序 → 无到期信息者次之 → `error != nil` 的失败卡片最后；同级保持传入顺序（稳定）。
+  - `CreditStatMapper.columns`：按 `ManagedProvider.allCases` 切列，空 provider 不产生列。
+  - `CreditPackageOrdering.sorted`：包明细顺序 = ① 仍有剩余且未到期的包按 `expireAt` 升序 ② 已到期/已用尽的包按 `expireAt` 升序 ③ 无 `expireAt` 的包最后；同级稳定。`CreditPackageOrdering.upcoming` 取该顺序中前段的「有效且带日期」子集，供卡片「即将到期」预览复用，因此预览与「查看全部积分包」明细顺序必然一致。
 
 ### 1.2 服务层（网络编排，与 Store 解耦）
 
@@ -48,7 +52,8 @@
 - 职责：积分统计区的渲染、加载态、错误态。
 - 不负责：任何业务计算。
 - 位置：`OverviewView.body` 的 ScrollView VStack 最上方，先于 `hero`。
-- 形态：区块标题「积分统计」+ 响应式卡片网格（LazyVGrid，与现有 MetricTile 网格口径一致）；每卡片含：provider 图标+账号名+「当前」徽标、主数值（总积分/不限量/请求）、近期到期行（数值 + 日期，无近期到期时显示最近到期或「—」）、错误行（内联红字）。
+- 形态：区块标题「积分统计」+ **按客户端分列的三列布局**（等宽 `HStack`，每列一个 app：WorkBuddy / Trae CN / TRAE Work，列头 = provider 图标 + 名称 + 该列卡片数；空客户端不渲染该列）；每卡片含：provider 图标+账号名+「当前」徽标、主数值（总积分/不限量/请求）、「即将到期」预览（最多 3 条，数值 + 名称 + 到期日）、「查看全部积分包」入口（popover 详情，顺序与预览同源）、错误行（内联红字）。
+- 首次加载（尚无 `creditStats`）：按「有已保存账号的 app」铺骨架列，列头与正式态一致。
 
 ## 2. 数据流
 
@@ -83,7 +88,7 @@
 ## 4. 账号身份与排序
 
 - 身份：WorkBuddy 用 `profile.id`；Trae 用 `profile.variant + userID`（即 `profile.id`）。
-- 排序（默认，见 requirements §11）：WorkBuddy（lastUsedAt 倒序）→ Trae CN → TRAE Work；后续可改 by 排序函数集中化。
+- 排序（v2 已定，见 requirements §11 与 FR-15）：按客户端分列，列内按「最近到期」升序；排序全部集中在 `CreditStatMapper` / `CreditPackageOrdering` 纯函数，界面不做二次排序。
 - 命名：索引昵称优先，缺失用 `shortID`。
 
 ## 5. 安全边界
@@ -106,6 +111,10 @@
 | FR-9 | 401/403 → 内联 error（1.2/1.5） |
 | FR-10 | refreshGeneration 校验（1.3） |
 | FR-11 | 安全边界（§5） |
+| FR-12 | 卡片「即将到期」预览 = `CreditPackageOrdering.upcoming`（1.1/1.5） |
+| FR-13 | 「查看全部积分包」popover = `CreditPackageOrdering.sorted`（1.1/1.5） |
+| FR-14 | `CreditStatMapper.columns` → 三列布局，空客户端不出列（1.1/1.5） |
+| FR-15 | `CreditStatMapper.sort` / `orderingExpiry` + `CreditPackageOrdering`（1.1） |
 
 ## 7. NFR 落实
 
@@ -137,3 +146,4 @@
 | 版本 | 日期 | 说明 |
 |---|---|---|
 | v1 | 2026-09-14 | 初稿；NFR-2 随 requirements v1 修订（Trae 超时沿用既有服务） |
+| v2 | 2026-09-15 | 增量：1.1 排序改为 `orderingExpiry` / `columns` / `CreditPackageOrdering` 纯函数族；1.5 形态改为按客户端三列布局；§4 排序规则改写；§6 补 FR-12~FR-15 映射 |

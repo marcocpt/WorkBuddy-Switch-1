@@ -127,6 +127,51 @@ struct AccountCreditStat: Identifiable, Hashable, Sendable {
     }
 }
 
+/// 积分统计的一列：一个 app（provider）一列，列内卡片按到期排序。
+struct CreditStatColumn: Identifiable, Sendable {
+    let provider: ManagedProvider
+    let stats: [AccountCreditStat]
+
+    var id: String { provider.rawValue }
+}
+
+/// 积分包列表的展示顺序（卡片内「即将到期」预览与「查看全部积分包」共用同一套顺序）。
+enum CreditPackageOrdering {
+    /// ① 仍有剩余且未到期的包：到期日升序（最快到期在最前）
+    /// ② 已到期 / 已用尽的包：到期日升序
+    /// ③ 无到期日的包：最后
+    /// 同组内保持稳定（不重排接口返回的原始顺序）。
+    static func sorted(_ packages: [CreditPackage]) -> [CreditPackage] {
+        packages.enumerated()
+            .map { (offset: $0.offset, bucket: bucket($0.element), date: $0.element.expireAt, element: $0.element) }
+            .sorted { lhs, rhs in
+                if lhs.bucket != rhs.bucket { return lhs.bucket < rhs.bucket }
+                switch (lhs.date, rhs.date) {
+                case let (left?, right?):
+                    if left != right { return left < right }
+                case (_?, nil):
+                    return true
+                case (nil, _?):
+                    return false
+                case (nil, nil):
+                    break
+                }
+                return lhs.offset < rhs.offset
+            }
+            .map(\.element)
+    }
+
+    /// 仍带剩余、未过期且有到期日的包：排序后的前段，即「即将到期」预览。
+    static func upcoming(_ packages: [CreditPackage]) -> [CreditPackage] {
+        sorted(packages).filter { $0.remaining > 0 && !$0.expired && $0.expireAt != nil }
+    }
+
+    private static func bucket(_ pkg: CreditPackage) -> Int {
+        guard pkg.expireAt != nil else { return 2 }
+        return pkg.remaining > 0 && !pkg.expired ? 0 : 1
+    }
+}
+
 // MARK: - 常量
 
 enum CreditStatsRules {

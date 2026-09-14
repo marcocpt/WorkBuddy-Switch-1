@@ -318,14 +318,55 @@ enum CreditStatMapper {
         )
     }
 
-    /// 稳定排序：WorkBuddy → Trae CN → TRAE Work；组内保持输入顺序。
+    /// 卡片排序/分组用的「最近到期」：优先取该卡片里最早的一个「仍有剩余且未到期」的积分包到期日；
+    /// 没有这类带日期的包时，才回落到卡片自身的到期/结算日（Trae 的下次结算日即走此回落）。
+    static func orderingExpiry(_ stat: AccountCreditStat) -> Date? {
+        let earliestLivePackage = stat.packages
+            .filter { $0.remaining > 0 && !$0.expired }
+            .compactMap(\.expireAt)
+            .min()
+        return earliestLivePackage ?? stat.soonestExpireAt
+    }
+
+    /// 稳定排序：WorkBuddy → Trae CN → TRAE Work；
+    /// 组内按「最近到期日」升序（最快到期在最前），无到期日的卡片次之，拉取失败的卡片最后；
+    /// 同级保持输入顺序。
     static func sort(_ stats: [AccountCreditStat]) -> [AccountCreditStat] {
         stats.enumerated().sorted { lhs, rhs in
-            if providerRank(lhs.element.provider) == providerRank(rhs.element.provider) {
-                return lhs.offset < rhs.offset
+            let leftRank = providerRank(lhs.element.provider)
+            let rightRank = providerRank(rhs.element.provider)
+            if leftRank != rightRank { return leftRank < rightRank }
+            let leftBucket = cardBucket(lhs.element)
+            let rightBucket = cardBucket(rhs.element)
+            if leftBucket != rightBucket { return leftBucket < rightBucket }
+            switch (orderingExpiry(lhs.element), orderingExpiry(rhs.element)) {
+            case let (left?, right?):
+                if left != right { return left < right }
+            case (_?, nil):
+                return true
+            case (nil, _?):
+                return false
+            case (nil, nil):
+                break
             }
-            return providerRank(lhs.element.provider) < providerRank(rhs.element.provider)
+            return lhs.offset < rhs.offset
         }.map(\.element)
+    }
+
+    /// 每个 app 一列；没有卡片的 app 不产生空列。列内沿用 sort 的到期顺序。
+    static func columns(_ stats: [AccountCreditStat]) -> [CreditStatColumn] {
+        let sorted = sort(stats)
+        return ManagedProvider.allCases.compactMap { provider in
+            let items = sorted.filter { $0.provider == provider }
+            guard !items.isEmpty else { return nil }
+            return CreditStatColumn(provider: provider, stats: items)
+        }
+    }
+
+    /// 卡片分组：有到期日 → 无到期日 → 拉取失败。
+    private static func cardBucket(_ stat: AccountCreditStat) -> Int {
+        if stat.error != nil { return 2 }
+        return orderingExpiry(stat) == nil ? 1 : 0
     }
 
     private static func providerRank(_ provider: ManagedProvider) -> Int {

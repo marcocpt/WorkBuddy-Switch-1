@@ -16,6 +16,14 @@
   (including an expired login) degrades only its own card to an inline message
   and never blocks the rest of the overview.
 
+- Order the credit statistics panel by expiry and lay it out as one column per
+  client (WorkBuddy, Trae CN, TRAE Work): cards inside a column lead with the
+  soonest expiry, dateless cards follow, and failed cards sink to the bottom.
+  A card's "near expiry" preview and its full package list now share one
+  expiry-ascending order (live packages first, then expired or used-up ones,
+  then dateless ones). Trae cards are ordered by their earliest live package
+  expiry instead of the next billing date, so the on-screen order matches the
+  dates shown inside each card.
 - Fix Trae CN usage reads after switching to an account whose login has
   expired: the app now prefers the live storage credentials maintained by the
   running Trae app, waits and retries automatically on 401/403 instead of

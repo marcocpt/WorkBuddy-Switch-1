@@ -3729,6 +3729,196 @@ enum OpenUsageSelfTest {
             "a failing account card coexists with healthy cards without corrupting them"
         )
 
+        // T-SR-02：同 provider 内按「最近到期日」升序（最快到期在最上），无到期日次之，失败卡最后
+        let colWbFar = AccountCreditStat.workBuddy(
+            accountID: "wb-far",
+            accountName: "WB Far",
+            isCurrent: false,
+            sourceUserID: "wb-far"
+        ).resolving(
+            totalRemaining: 100,
+            expiringSoonRemaining: 0,
+            soonestExpireAt: creditNow.addingTimeInterval(10 * 24 * 3600),
+            unit: .credits
+        )
+        let colWbNoDate = AccountCreditStat.workBuddy(
+            accountID: "wb-nodate",
+            accountName: "WB NoDate",
+            isCurrent: false,
+            sourceUserID: "wb-nodate"
+        ).resolving(
+            totalRemaining: nil,
+            expiringSoonRemaining: 0,
+            soonestExpireAt: nil,
+            unit: .unlimited
+        )
+        let expirySortedStats = CreditStatMapper.sort([
+            colWbFar, wbErrorStat, colWbNoDate, wbStat
+        ])
+        try expect(
+            expirySortedStats.map(\.accountID)
+                == ["wb-user-1", "wb-far", "wb-nodate", "wb-user-2"],
+            "credit cards inside one provider sort by soonest expiry with dateless and failed cards last"
+        )
+        try expect(
+            CreditStatMapper.sort([traeRequestStat, wbStat]).map(\.provider)
+                == [.workBuddy, .traeCN],
+            "expiry ordering stays inside the provider grouping"
+        )
+
+        // T-COL-01：三列分组 —— 每个 app 一列，空 provider 不出现，列内沿用到期排序
+        let statColumns = CreditStatMapper.columns([
+            colWbFar, traeRequestStat, wbErrorStat, traeCreditsStat, wbStat, traeUnlimitedStat
+        ])
+        try expect(
+            statColumns.map(\.provider) == [.workBuddy, .traeCN, .traeWork],
+            "credit stats group into one column per app in provider order"
+        )
+        try expect(
+            statColumns[0].stats.map(\.accountID) == ["wb-user-1", "wb-far", "wb-user-2"]
+                && statColumns[1].stats.map(\.accountID)
+                    == ["china:shared-fixture-user", "china:request-user"]
+                && statColumns[2].stats.map(\.accountID) == ["work:unlimited-user"],
+            "each app column keeps its own soonest-expiry ordering"
+        )
+        try expect(
+            CreditStatMapper.columns([wbStat]).count == 1
+                && CreditStatMapper.columns([wbStat])[0].provider == .workBuddy,
+            "apps without any card produce no empty column"
+        )
+
+        // T-SR-03：排序键优先取卡片里最早的有效包到期日（Trae 的「下次结算日」只作回落）
+        let earlyPackStat = AccountCreditStat.workBuddy(
+            accountID: "trae-like-early-pack",
+            accountName: "EarlyPack",
+            isCurrent: false,
+            sourceUserID: "trae-like-early-pack"
+        ).resolving(
+            totalRemaining: 500,
+            expiringSoonRemaining: 0,
+            soonestExpireAt: creditNow.addingTimeInterval(10 * 24 * 3600),
+            unit: .credits,
+            packages: [
+                CreditPackage(
+                    name: "daily",
+                    total: 100,
+                    remaining: 60,
+                    used: 40,
+                    expireAt: creditNow.addingTimeInterval(1 * 24 * 3600),
+                    expired: false,
+                    expiringSoon: true
+                )
+            ]
+        )
+        let settlementOnlyStat = AccountCreditStat.workBuddy(
+            accountID: "trae-like-settlement",
+            accountName: "Settlement",
+            isCurrent: false,
+            sourceUserID: "trae-like-settlement"
+        ).resolving(
+            totalRemaining: 500,
+            expiringSoonRemaining: 0,
+            soonestExpireAt: creditNow.addingTimeInterval(2 * 24 * 3600),
+            unit: .credits
+        )
+        try expect(
+            CreditStatMapper.sort([settlementOnlyStat, earlyPackStat]).map(\.accountID)
+                == ["trae-like-early-pack", "trae-like-settlement"],
+            "a card with an earlier package expiry outranks a card with only a settlement date"
+        )
+        try expect(
+            CreditStatMapper.orderingExpiry(earlyPackStat)
+                == creditNow.addingTimeInterval(1 * 24 * 3600)
+                && CreditStatMapper.orderingExpiry(settlementOnlyStat)
+                    == creditNow.addingTimeInterval(2 * 24 * 3600),
+            "ordering expiry prefers the earliest live package date and falls back to settlement"
+        )
+        let deadPackOnlyStat = AccountCreditStat.workBuddy(
+            accountID: "trae-like-dead-pack",
+            accountName: "DeadPack",
+            isCurrent: false,
+            sourceUserID: "trae-like-dead-pack"
+        ).resolving(
+            totalRemaining: 0,
+            expiringSoonRemaining: 0,
+            soonestExpireAt: creditNow.addingTimeInterval(3 * 24 * 3600),
+            unit: .credits,
+            packages: [
+                CreditPackage(
+                    name: "expired",
+                    total: 100,
+                    remaining: 0,
+                    used: 100,
+                    expireAt: creditNow.addingTimeInterval(-1 * 24 * 3600),
+                    expired: true,
+                    expiringSoon: false
+                )
+            ]
+        )
+        try expect(
+            CreditStatMapper.orderingExpiry(deadPackOnlyStat)
+                == creditNow.addingTimeInterval(3 * 24 * 3600),
+            "expired or used-up packages do not become the ordering key"
+        )
+
+        // T-PKG-03：卡片内积分包列表按到期从近到远（有效包 → 已失效 → 无到期日）
+        let pkgNear = CreditPackage(
+            name: "near",
+            total: 100,
+            remaining: 90,
+            used: 10,
+            expireAt: creditNow.addingTimeInterval(1 * 24 * 3600),
+            expired: false,
+            expiringSoon: true
+        )
+        let pkgFar = CreditPackage(
+            name: "far",
+            total: 100,
+            remaining: 90,
+            used: 10,
+            expireAt: creditNow.addingTimeInterval(20 * 24 * 3600),
+            expired: false,
+            expiringSoon: false
+        )
+        let pkgExpired = CreditPackage(
+            name: "expired",
+            total: 100,
+            remaining: 40,
+            used: 60,
+            expireAt: creditNow.addingTimeInterval(-2 * 24 * 3600),
+            expired: true,
+            expiringSoon: false
+        )
+        let pkgUsedUp = CreditPackage(
+            name: "used-up",
+            total: 100,
+            remaining: 0,
+            used: 100,
+            expireAt: creditNow.addingTimeInterval(5 * 24 * 3600),
+            expired: false,
+            expiringSoon: false
+        )
+        let pkgNoDate = CreditPackage(
+            name: "no-date",
+            total: nil,
+            remaining: 50,
+            used: 0,
+            expireAt: nil,
+            expired: false,
+            expiringSoon: false
+        )
+        try expect(
+            CreditPackageOrdering.sorted([pkgFar, pkgNoDate, pkgUsedUp, pkgNear, pkgExpired])
+                .map(\.name) == ["near", "far", "expired", "used-up", "no-date"],
+            "package lists lead with the soonest expiry then dead packages then dateless ones"
+        )
+        try expect(
+            CreditPackageOrdering.sorted([pkgFar, pkgNoDate, pkgUsedUp, pkgNear, pkgExpired])
+                .filter { $0.remaining > 0 && !$0.expired && $0.expireAt != nil }
+                .map(\.name) == ["near", "far"],
+            "the near-expiry preview is the front slice of the same ordering"
+        )
+
         // MARK: - 概览页积分统计：服务层隔离（Phase 2）
 
         let isoNow = Date(timeIntervalSince1970: 1_750_000_000)
@@ -4064,7 +4254,7 @@ enum OpenUsageSelfTest {
         )
 
         // T-KC-04：Trae 批量读取（loadAll）按 keychainAccount 映射，单次调用覆盖全部账号
-        let bulkVault = FixtureTraeVault()
+        let traeBulkVault = FixtureTraeVault()
         for (userID, variant) in [
             ("bulk-cn-1", TraeVariant.china),
             ("bulk-cn-2", TraeVariant.china),
@@ -4077,7 +4267,7 @@ enum OpenUsageSelfTest {
                 displayName: userID,
                 keyByte: UInt8(userID.count % 251 + 1)
             )
-            _ = try bulkVault.insertIfAbsent(
+            _ = try traeBulkVault.insertIfAbsent(
                 TraeCredentialSnapshot(
                     variant: variant,
                     userID: userID,
@@ -4088,7 +4278,7 @@ enum OpenUsageSelfTest {
                 )
             )
         }
-        let loadedAll = try bulkVault.loadAll()
+        let loadedAll = try traeBulkVault.loadAll()
         try expect(
             loadedAll.count == 3
                 && Set(loadedAll.keys) == [
@@ -4432,10 +4622,6 @@ private final class FixtureTraeVault: TraeCredentialVaulting, @unchecked Sendabl
         snapshots[snapshot.keychainAccount] = snapshot
         savedAccounts.insert(snapshot.keychainAccount)
         return true
-    }
-
-    func loadAll() throws -> [String: TraeCredentialSnapshot] {
-        snapshots
     }
 
     func delete(variant: TraeVariant, userID: String) throws {
