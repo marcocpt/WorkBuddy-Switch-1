@@ -3883,6 +3883,92 @@ enum OpenUsageSelfTest {
             "an expired Trae account degrades to an inline error card"
         )
 
+        // T-KC-04：Trae 批量读取（loadAll）按 keychainAccount 映射，单次调用覆盖全部账号
+        let bulkVault = FixtureTraeVault()
+        for (userID, variant) in [
+            ("bulk-cn-1", TraeVariant.china),
+            ("bulk-cn-2", TraeVariant.china),
+            ("bulk-wk-1", TraeVariant.work)
+        ] {
+            let auth = try fixtureTraeAuth(
+                userID: userID,
+                token: "bulk-token",
+                host: variant == .china ? "api.trae.cn" : "grow-normal.trae.ai",
+                displayName: userID,
+                keyByte: UInt8(userID.count % 251 + 1)
+            )
+            _ = try bulkVault.insertIfAbsent(
+                TraeCredentialSnapshot(
+                    variant: variant,
+                    userID: userID,
+                    authBlob: auth.blob,
+                    userTagBlob: nil,
+                    deviceAuthBlobs: [:],
+                    capturedAt: isoNow
+                )
+            )
+        }
+        let loadedAll = try bulkVault.loadAll()
+        try expect(
+            loadedAll.count == 3
+                && Set(loadedAll.keys) == [
+                    "china:bulk-cn-1",
+                    "china:bulk-cn-2",
+                    "work:bulk-wk-1"
+                ]
+                && loadedAll["work:bulk-wk-1"]?.variant == .work,
+            "Trae bulk vault read maps every account by its keychain account key"
+        )
+
+        // T-KC-05：loadAll 映射的身份一致性防线——kSecAttrAccount 与快照身份不符的项必须丢弃
+        let kcSnapshotEncoder = JSONEncoder()
+        kcSnapshotEncoder.dateEncodingStrategy = .iso8601
+        let kcSnapshotDecoder = JSONDecoder()
+        kcSnapshotDecoder.dateDecodingStrategy = .iso8601
+        let goodBulkAuth = try fixtureTraeAuth(
+            userID: "bulk-cn-1",
+            token: "bulk-good",
+            host: "api.trae.cn",
+            displayName: "Bulk Good",
+            keyByte: 61
+        )
+        let goodBulkSnapshot = TraeCredentialSnapshot(
+            variant: .china,
+            userID: "bulk-cn-1",
+            authBlob: goodBulkAuth.blob,
+            userTagBlob: nil,
+            deviceAuthBlobs: [:],
+            capturedAt: isoNow
+        )
+        let mismatchedBulkSnapshot = TraeCredentialSnapshot(
+            variant: .work,
+            userID: "other-user",
+            authBlob: goodBulkAuth.blob,
+            userTagBlob: nil,
+            deviceAuthBlobs: [:],
+            capturedAt: isoNow
+        )
+        let bulkItems: [[String: Any]] = [
+            [
+                kSecAttrAccount as String: "china:bulk-cn-1",
+                kSecValueData as String: try kcSnapshotEncoder.encode(mismatchedBulkSnapshot)
+            ],
+            [
+                kSecAttrAccount as String: "china:bulk-cn-1",
+                kSecValueData as String: try kcSnapshotEncoder.encode(goodBulkSnapshot)
+            ]
+        ]
+        let bulkMapped = TraeCredentialVault.mapLoaded(
+            bulkItems,
+            decoder: kcSnapshotDecoder
+        )
+        try expect(
+            bulkMapped.count == 1
+                && bulkMapped["china:bulk-cn-1"]?.userID == "bulk-cn-1"
+                && bulkMapped["china:bulk-cn-1"]?.variant == .china,
+            "Trae bulk load drops items whose stored identity does not match the keychain account"
+        )
+
         print("OpenUsage self-test passed: \(assertions) assertions")
     }
 }
@@ -4158,6 +4244,10 @@ private final class FixtureTraeVault: TraeCredentialVaulting, @unchecked Sendabl
         snapshots[snapshot.keychainAccount] = snapshot
         savedAccounts.insert(snapshot.keychainAccount)
         return true
+    }
+
+    func loadAll() throws -> [String: TraeCredentialSnapshot] {
+        snapshots
     }
 
     func delete(variant: TraeVariant, userID: String) throws {

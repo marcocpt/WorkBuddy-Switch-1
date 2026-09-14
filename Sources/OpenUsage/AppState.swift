@@ -296,6 +296,7 @@ final class AppState: ObservableObject {
 
     /// 全量刷新已保存账号的积分统计（三端，逐账号一张卡）。
     /// 单账号失败由服务层转成错误卡片；凭据缺失直接置错误卡；代际校验丢弃过期结果。
+    /// 凭据读取走「每服务一次」的批量钥匙串调用，避免按账号数量重复弹出钥匙串授权。
     private func refreshCreditStats() async {
         creditStatsGeneration &+= 1
         let generation = creditStatsGeneration
@@ -308,88 +309,133 @@ final class AppState: ObservableObject {
 
         var workBuddyInputs: [WorkBuddyCreditAccount] = []
         var directFailures: [AccountCreditStat] = []
-        for profile in accounts.accounts {
-            let isCurrent = profile.id == accounts.currentUserID
-            if isCurrent {
-                guard let document = try? AuthDocument.loadActive() else {
-                    directFailures.append(
-                        .failure(
-                            provider: .workBuddy,
-                            accountID: profile.id,
-                            accountName: profile.nickname,
-                            isCurrent: true,
-                            sourceUserID: profile.id,
-                            error: "无法读取当前 WorkBuddy 登录信息"
-                        )
-                    )
-                    continue
-                }
-                workBuddyInputs.append(
-                    WorkBuddyCreditAccount(
-                        userID: profile.id,
-                        accountID: profile.id,
-                        accountName: profile.nickname,
-                        isCurrent: true,
-                        authData: document.rawData
-                    )
-                )
-            } else if let stored = try? accounts.credentialData(for: profile.id) {
-                workBuddyInputs.append(
-                    WorkBuddyCreditAccount(
-                        userID: profile.id,
-                        accountID: profile.id,
-                        accountName: profile.nickname,
-                        isCurrent: false,
-                        authData: stored
-                    )
-                )
-            } else {
+        var workBuddyBlobs: [String: Data]
+        var workBuddyReadSucceeded: Bool
+        do {
+            workBuddyBlobs = try accounts.allCredentialData()
+            workBuddyReadSucceeded = true
+        } catch {
+            workBuddyReadSucceeded = false
+            workBuddyBlobs = [:]
+            // 批量读取失败（如钥匙串锁定/未授权）：该 provider 全部账号一张失败卡，不再继续组装或请求
+            for profile in accounts.accounts {
                 directFailures.append(
                     .failure(
                         provider: .workBuddy,
                         accountID: profile.id,
                         accountName: profile.nickname,
-                        isCurrent: false,
+                        isCurrent: profile.id == accounts.currentUserID,
                         sourceUserID: profile.id,
-                        error: "凭据不可用，请重新登录并保存"
+                        error: "凭据读取失败，请解锁钥匙串后刷新重试"
                     )
                 )
             }
         }
+        if workBuddyReadSucceeded {
+            for profile in accounts.accounts {
+                let isCurrent = profile.id == accounts.currentUserID
+                if isCurrent {
+                    guard let document = try? AuthDocument.loadActive() else {
+                        directFailures.append(
+                            .failure(
+                                provider: .workBuddy,
+                                accountID: profile.id,
+                                accountName: profile.nickname,
+                                isCurrent: true,
+                                sourceUserID: profile.id,
+                                error: "无法读取当前 WorkBuddy 登录信息"
+                            )
+                        )
+                        continue
+                    }
+                    workBuddyInputs.append(
+                        WorkBuddyCreditAccount(
+                            userID: profile.id,
+                            accountID: profile.id,
+                            accountName: profile.nickname,
+                            isCurrent: true,
+                            authData: document.rawData
+                        )
+                    )
+                } else if let stored = workBuddyBlobs[profile.id] {
+                    workBuddyInputs.append(
+                        WorkBuddyCreditAccount(
+                            userID: profile.id,
+                            accountID: profile.id,
+                            accountName: profile.nickname,
+                            isCurrent: false,
+                            authData: stored
+                        )
+                    )
+                } else {
+                    directFailures.append(
+                        .failure(
+                            provider: .workBuddy,
+                            accountID: profile.id,
+                            accountName: profile.nickname,
+                            isCurrent: false,
+                            sourceUserID: profile.id,
+                            error: "凭据不可用，请重新登录并保存"
+                        )
+                    )
+                }
+            }
+        }
 
         var traeInputs: [TraeCreditAccount] = []
-        for variant in TraeVariant.allCases {
-            let currentUserID = traeAccounts.currentUserID(for: variant)
-            for profile in traeAccounts.accounts(for: variant) {
-                let isCurrent = profile.userID == currentUserID
-                guard
-                    let snapshot = try? traeAccounts.snapshot(
-                        for: variant,
-                        userID: profile.userID
-                    )
-                else {
+        var traeSnapshots: [String: TraeCredentialSnapshot]
+        var traeReadSucceeded: Bool
+        do {
+            traeSnapshots = try traeAccounts.allSnapshots()
+            traeReadSucceeded = true
+        } catch {
+            traeReadSucceeded = false
+            traeSnapshots = [:]
+            for variant in TraeVariant.allCases {
+                let currentUserID = traeAccounts.currentUserID(for: variant)
+                for profile in traeAccounts.accounts(for: variant) {
                     directFailures.append(
                         .failure(
                             provider: variant.provider,
                             accountID: profile.id,
                             accountName: profile.nickname,
-                            isCurrent: isCurrent,
+                            isCurrent: profile.userID == currentUserID,
                             sourceUserID: profile.userID,
-                            error: "凭据快照不可用，请重新登录并保存"
+                            error: "凭据读取失败，请解锁钥匙串后刷新重试"
                         )
                     )
-                    continue
                 }
-                traeInputs.append(
-                    TraeCreditAccount(
-                        variant: variant,
-                        profileID: profile.id,
-                        userID: profile.userID,
-                        accountName: profile.nickname,
-                        isCurrent: isCurrent,
-                        snapshot: snapshot
+            }
+        }
+        if traeReadSucceeded {
+            for variant in TraeVariant.allCases {
+                let currentUserID = traeAccounts.currentUserID(for: variant)
+                for profile in traeAccounts.accounts(for: variant) {
+                    let isCurrent = profile.userID == currentUserID
+                    guard let snapshot = traeSnapshots[profile.id] else {
+                        directFailures.append(
+                            .failure(
+                                provider: variant.provider,
+                                accountID: profile.id,
+                                accountName: profile.nickname,
+                                isCurrent: isCurrent,
+                                sourceUserID: profile.userID,
+                                error: "凭据快照不可用，请重新登录并保存"
+                            )
+                        )
+                        continue
+                    }
+                    traeInputs.append(
+                        TraeCreditAccount(
+                            variant: variant,
+                            profileID: profile.id,
+                            userID: profile.userID,
+                            accountName: profile.nickname,
+                            isCurrent: isCurrent,
+                            snapshot: snapshot
+                        )
                     )
-                )
+                }
             }
         }
 

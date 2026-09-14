@@ -523,6 +523,9 @@ protocol TraeCredentialVaulting {
     func probeExistence(variant: TraeVariant, userID: String) throws -> Bool
     /// 仅创建写入：已存在返回 false，新插入返回 true。
     func insertIfAbsent(_ snapshot: TraeCredentialSnapshot) throws -> Bool
+    /// 单次批量读取 service 下全部快照，按 keychainAccount 映射。避免按账号逐项发起
+    /// SecItemCopyMatching，从而减少 Keychain 锁定/未授权时的重复授权机会；空字典表示无条目。
+    func loadAll() throws -> [String: TraeCredentialSnapshot]
 }
 
 struct TraeCredentialVault: TraeCredentialVaulting {
@@ -629,6 +632,58 @@ struct TraeCredentialVault: TraeCredentialVaulting {
         case errSecDuplicateItem: return false
         default: throw TraeSupportError.keychain(message(for: status))
         }
+    }
+
+    /// 单次批量读取 service 下全部快照，按 keychainAccount 映射；空字典表示无条目；故障抛错。
+    /// 避免按账号逐项发起 SecItemCopyMatching，减少重复授权机会。
+    /// 与单条读取一致保持身份防线：kSecAttrAccount 必须等于 snapshot.keychainAccount，否则丢弃。
+    func loadAll() throws -> [String: TraeCredentialSnapshot] {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecReturnData as String: true,
+            kSecReturnAttributes as String: true,
+            // 用数字 limit：kSecMatchLimitAll 字符串与 kSecReturnData 组合在 macOS 13 返回 errSecParam(-50)。
+            kSecMatchLimit as String: 10_000
+        ]
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        switch status {
+        case errSecSuccess:
+            let items: [[String: Any]]
+            if let array = result as? [[String: Any]] {
+                items = array
+            } else if let single = result as? [String: Any] {
+                items = [single]
+            } else {
+                items = []
+            }
+            return Self.mapLoaded(items, decoder: decoder)
+        case errSecItemNotFound:
+            return [:]
+        default:
+            throw TraeSupportError.keychain(message(for: status))
+        }
+    }
+
+    /// 批量读取的纯映射（含身份一致性防线），便于离线单测。
+    static func mapLoaded(
+        _ items: [[String: Any]],
+        decoder: JSONDecoder
+    ) -> [String: TraeCredentialSnapshot] {
+        var map: [String: TraeCredentialSnapshot] = [:]
+        for item in items {
+            guard
+                let account = item[kSecAttrAccount as String] as? String,
+                let data = item[kSecValueData as String] as? Data,
+                let snapshot = try? decoder.decode(TraeCredentialSnapshot.self, from: data),
+                snapshot.keychainAccount == account
+            else {
+                continue
+            }
+            map[account] = snapshot
+        }
+        return map
     }
 
     private func message(for status: OSStatus) -> String {
@@ -1132,6 +1187,12 @@ final class TraeAccountStore: ObservableObject {
         userID: String
     ) throws -> TraeCredentialSnapshot {
         try vault.load(variant: variant, userID: userID)
+    }
+
+    /// 只读批量读取：单次钥匙串调用取回全部账号快照，减少 Keychain 未授权时的重复授权机会，
+    /// 键为 profile.id（variant:userID）。
+    func allSnapshots() throws -> [String: TraeCredentialSnapshot] {
+        try vault.loadAll()
     }
 
     private func readCurrent(

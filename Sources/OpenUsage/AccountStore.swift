@@ -140,6 +140,11 @@ final class AccountStore: ObservableObject {
         try vault.loadData(account: userID)
     }
 
+    /// 只读批量读取：单次钥匙串调用取回全部账号凭据，减少 Keychain 未授权时的重复授权机会。
+    func allCredentialData() throws -> [String: Data] {
+        try vault.loadAllData()
+    }
+
     /// 导出用：枚举全部索引账号并镜像钥匙串凭据（严格只读；缺失快照返回 blob=nil，不中断）。
     func backupExportItems() -> [(profile: AccountProfile, blob: Data?)] {
         accounts.map { profile in
