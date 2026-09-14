@@ -118,6 +118,7 @@ actor CreditStatsService {
                 now: now
             )
             let summary = WorkBuddyCreditParser.summarize(resources, now: now)
+            let packages = WorkBuddyCreditParser.packages(from: resources)
             return baseStat(
                 provider: .workBuddy,
                 accountID: account.accountID,
@@ -128,7 +129,8 @@ actor CreditStatsService {
                 totalRemaining: summary.totalRemaining,
                 expiringSoonRemaining: summary.expiringSoonRemaining,
                 soonestExpireAt: summary.soonestExpireAt,
-                unit: .credits
+                unit: .credits,
+                packages: packages
             )
         } catch let error as WorkBuddyCreditError {
             return workBuddyFailure(account, message: error.message)
@@ -281,6 +283,23 @@ enum CreditStatMapper {
         } else {
             expiringSoon = 0
         }
+        let packages = quota.packs.map { pack in
+            let packRemaining = pack.limit.map { max($0 - pack.used, 0) } ?? 0
+            let expireAt = pack.expireAt
+            return CreditPackage(
+                name: pack.name,
+                total: pack.limit,
+                remaining: packRemaining,
+                used: pack.used,
+                expireAt: expireAt,
+                expired: packRemaining > 0
+                    && (expireAt.map { $0 <= now } ?? false),
+                expiringSoon: packRemaining > 0
+                    && (expireAt.map {
+                        now < $0 && $0 <= now.addingTimeInterval(CreditStatsRules.expiringSoonDays)
+                    } ?? false)
+            )
+        }
         return AccountCreditStat(
             provider: variant.provider,
             accountID: accountID,
@@ -291,7 +310,8 @@ enum CreditStatMapper {
             expiringSoonRemaining: expiringSoon,
             soonestExpireAt: soonest,
             error: nil,
-            sourceUserID: sourceUserID
+            sourceUserID: sourceUserID,
+            packages: packages
         )
     }
 

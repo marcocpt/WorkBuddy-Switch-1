@@ -608,6 +608,20 @@ private struct CreditStatCard: View {
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                if !stat.packages.isEmpty {
+                    DisclosureGroup {
+                        VStack(alignment: .leading, spacing: 10) {
+                            ForEach(stat.packages.indices, id: \.self) { index in
+                                CreditPackageRow(pkg: stat.packages[index])
+                            }
+                        }
+                        .padding(.top, 6)
+                    } label: {
+                        Text("全部积分包（\(stat.packages.count)）")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
+                    }
+                }
             }
         }
         .padding(14)
@@ -661,19 +675,31 @@ private struct CreditStatCard: View {
     }
 
     private var expiryLine: String {
+        // 始终展示近期到期：取「仍有剩余且带到期日」中最近的一个积分包
+        if let pkg = nearExpiryPackage, let date = pkg.expireAt {
+            let day = Self.shortDateFormatter.string(from: date)
+            let amount = Self.amountText(pkg.remaining)
+            let unit = stat.unit == .requests ? "请求" : "积分"
+            return "近期到期 \(amount) \(unit) · \(day)"
+        }
         guard let date = stat.soonestExpireAt else {
             return stat.provider == .workBuddy ? "暂无可展示的到期" : "暂无结算日期"
         }
         let day = Self.shortDateFormatter.string(from: date)
-        if stat.expiringSoonRemaining > 0 {
-            let amount = stat.expiringSoonRemaining.rounded() == stat.expiringSoonRemaining
-                ? String(Int(stat.expiringSoonRemaining))
-                : DisplayFormat.credits(stat.expiringSoonRemaining)
-            let unit = stat.unit == .requests ? "请求" : "积分"
-            return "近期到期 \(amount) \(unit) · \(day)"
-        }
         let prefix = stat.provider == .workBuddy ? "最近到期" : "下次结算"
         return "\(prefix) \(day)"
+    }
+
+    private var nearExpiryPackage: CreditPackage? {
+        stat.packages
+            .filter { $0.remaining > 0 && !$0.expired && $0.expireAt != nil }
+            .min { $0.expireAt! < $1.expireAt! }
+    }
+
+    private static func amountText(_ value: Double) -> String {
+        value.rounded() == value
+            ? String(Int(value))
+            : DisplayFormat.credits(value)
     }
 
     private static let shortDateFormatter: DateFormatter = {
@@ -681,4 +707,67 @@ private struct CreditStatCard: View {
         formatter.dateFormat = "M/d"
         return formatter
     }()
+}
+
+/// 单个积分/权益包明细行（名称 + 剩余/总量 + 进度条 + 到期/已用）。
+private struct CreditPackageRow: View {
+    let pkg: CreditPackage
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Text(pkg.name)
+                    .font(.system(size: 11, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 4)
+                if pkg.isUnlimited {
+                    Text("不限量")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("\(CreditStatCard.amountText(pkg.remaining)) / \(CreditStatCard.amountText(pkg.total ?? 0))")
+                        .font(.system(size: 11, weight: .semibold))
+                        .monospacedDigit()
+                }
+            }
+            GeometryReader { proxy in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.primary.opacity(0.08))
+                    Capsule()
+                        .fill(
+                            pkg.expired
+                                ? OpenUsageColors.coral
+                                : (pkg.expiringSoon ? OpenUsageColors.coral : OpenUsageColors.blue)
+                        )
+                        .frame(width: proxy.size.width * ratio)
+                }
+            }
+            .frame(height: 4)
+            Text(detailLine)
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+    }
+
+    private var ratio: Double {
+        guard let total = pkg.total, total > 0 else { return pkg.isUnlimited ? 1 : 0 }
+        return min(max(pkg.remaining / total, 0), 1)
+    }
+
+    private var detailLine: String {
+        var parts: [String] = []
+        if pkg.expired {
+            parts.append("已到期")
+        } else if pkg.expiringSoon {
+            parts.append("7 天内到期")
+        } else if let date = pkg.expireAt {
+            parts.append("到期 \(CreditStatCard.shortDateFormatter.string(from: date))")
+        } else {
+            parts.append("暂无到期")
+        }
+        parts.append("已用 \(CreditStatCard.amountText(pkg.used))")
+        return parts.joined(separator: " · ")
+    }
 }

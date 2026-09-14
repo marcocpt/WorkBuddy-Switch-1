@@ -21,6 +21,20 @@ struct CreditResource: Hashable, Sendable {
     var expiringSoon: Bool
 }
 
+/// 单个积分/权益包的展示明细（WorkBuddy 资源包 或 Trae 权益包）。
+struct CreditPackage: Hashable, Sendable {
+    let name: String
+    /// nil = 不限量（Trae 权益包透支负 limit 的口径）
+    let total: Double?
+    let remaining: Double
+    let used: Double
+    let expireAt: Date?
+    let expired: Bool
+    let expiringSoon: Bool
+
+    var isUnlimited: Bool { total == nil }
+}
+
 /// 单个已保存账号的积分统计视图模型（不含任何凭据字段）。
 struct AccountCreditStat: Identifiable, Hashable, Sendable {
     let provider: ManagedProvider
@@ -36,6 +50,8 @@ struct AccountCreditStat: Identifiable, Hashable, Sendable {
     let error: String?
     /// 用于刷新竞态绑定身份的账号真实 userID
     let sourceUserID: String
+    /// 全部积分包明细（WorkBuddy 资源包 / Trae 权益包）；未取到为空
+    var packages: [CreditPackage] = []
 
     var id: String { "\(provider.rawValue):\(accountID)" }
 
@@ -85,7 +101,8 @@ struct AccountCreditStat: Identifiable, Hashable, Sendable {
         totalRemaining: Double?,
         expiringSoonRemaining: Double,
         soonestExpireAt: Date?,
-        unit: CreditUsageUnit
+        unit: CreditUsageUnit,
+        packages: [CreditPackage] = []
     ) -> AccountCreditStat {
         AccountCreditStat(
             provider: provider,
@@ -97,7 +114,8 @@ struct AccountCreditStat: Identifiable, Hashable, Sendable {
             expiringSoonRemaining: expiringSoonRemaining,
             soonestExpireAt: soonestExpireAt,
             error: nil,
-            sourceUserID: sourceUserID
+            sourceUserID: sourceUserID,
+            packages: packages
         )
     }
 }
@@ -229,6 +247,23 @@ enum WorkBuddyCreditParser {
         let keys = ["DeductionEndTime", "ExpiredTime", "CycleEndTime"]
         return timestamp(string(account, keys: keys))
             ?? timestamp(numeric(account, keys: keys))
+    }
+
+    /// 资源包 → 展示明细（全部积分包列表）。
+    static func packages(from resources: [CreditResource]) -> [CreditPackage] {
+        resources.map { resource in
+            CreditPackage(
+                name: resource.packageName
+                    ?? resource.packageCode
+                    ?? "未命名资源包",
+                total: resource.total,
+                remaining: resource.remaining,
+                used: resource.used,
+                expireAt: resource.expireAt,
+                expired: resource.expired,
+                expiringSoon: resource.expiringSoon
+            )
+        }
     }
 
     // MARK: - 字段提取

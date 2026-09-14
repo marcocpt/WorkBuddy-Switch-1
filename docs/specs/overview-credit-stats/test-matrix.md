@@ -31,6 +31,8 @@
 | T-SR-01 | FR-2/§11 | 排序：WorkBuddy（lastUsedAt 倒序）→ Trae CN → TRAE Work | 输出顺序断言 |
 | T-ISO-01 | FR-8 | 混合结果：1 账号 error + 2 账号正常 | 仅该卡片 error，其余 totalRemaining 正常 |
 | T-RACE-01 | FR-10 | 服务层返回后按代际丢弃 | 由 AppState 层测试/代码评审覆盖（UI 集成，见 §3） |
+| T-PKG-01 | FR-13 | WorkBuddy 资源包 → 展示明细：名称回退、剩余/总量/已用、到期与 7 天/已到期状态 | 断言映射后的 CreditPackage 数值与标志 |
+| T-PKG-02 | FR-13 | Trae 多权益包解析与映射：每包剩余 = limit-used，展示名、毫秒级到期 | parseQuota.packs + 卡片 packages 断言 |
 
 ## 3. 集成与 UI 证据
 
@@ -55,4 +57,4 @@
 
 | 版本 | 日期 | 说明 |
 |---|---|---|
-| v1 | 2026-09-14 | 初稿；NFR-2 随 requirements v1 修订同步。T-PR-08 语义修订为「无法识别→失败」，补充 H-02/H-03/M-01 回归 |
+| v1 | 2026-09-14 | 初稿；NFR-2 随 requirements v1 修订同步。T-PR-08 语义修订为「无法识别→失败」，补充 H-02/H-03/M-01 回归；增量：新增 T-PKG-01/02（全部积分包明细） |

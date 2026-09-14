@@ -2376,6 +2376,13 @@ enum OpenUsageSelfTest {
                 && !creditsLimitQuota.isUnlimited,
             "Trae quota parser reads credits_limit/credits_amount packs as credit quotas"
         )
+        try expect(
+            creditsLimitQuota.packs.count == 1
+                && creditsLimitQuota.packs[0].name == "会员积分"
+                && creditsLimitQuota.packs[0].limit == 1500
+                && creditsLimitQuota.packs[0].used == 320,
+            "Trae quota parser exposes per-pack credit details for the package list"
+        )
 
         // MARK: - 导入 / 导出账号备份：载荷核心（Phase 1）
 
@@ -3513,6 +3520,103 @@ enum OpenUsageSelfTest {
             nearResetStat.expiringSoonRemaining == 20
                 && farResetStat.expiringSoonRemaining == 0,
             "Trae expiring-soon credits follow the 7-day horizon"
+        )
+
+        // T-PKG-01：WorkBuddy 资源包 → 展示明细（名称回退 / 数值 / 到期状态）
+        let pkgResources = [
+            nearExpiry,
+            WorkBuddyCreditParser.resource(
+                from: [
+                    "CycleCapacityRemainPrecise": "50",
+                    "DeductionEndTime": String(
+                        Int(creditNow.timeIntervalSince1970) + 20 * 24 * 3600
+                    )
+                ],
+                now: creditNow
+            )
+        ]
+        let pkgList = WorkBuddyCreditParser.packages(from: pkgResources)
+        try expect(
+            pkgList.count == 2
+                && pkgList[0].remaining == 80
+                && pkgList[0].expiringSoon
+                && pkgList[1].remaining == 50
+                && !pkgList[1].expiringSoon,
+            "WorkBuddy resource packages map to view packages with expiry flags"
+        )
+
+        // T-PKG-02：Trae 多权益包 → 卡片携带全部积分包（剩余与展示名）
+        let multiPackQuotaData = Data(
+            """
+            {
+              "data": {
+                "user_entitlement_pack_list": [
+                  {
+                    "entitlement_base_info": {
+                      "user_id": "multi-pack-user",
+                      "product_type": 1,
+                      "quota": { "credits_limit": 400 }
+                    },
+                    "usage": { "credits_amount": 100 },
+                    "expire_time": 1787500800123,
+                    "display_desc": "会员积分"
+                  },
+                  {
+                    "entitlement_base_info": {
+                      "user_id": "multi-pack-user",
+                      "product_type": 3,
+                      "quota": { "credits_limit": 100 }
+                    },
+                    "usage": { "credits_amount": 90 },
+                    "expire_time": 1787500800,
+                    "display_desc": "兑换积分"
+                  },
+                  {
+                    "entitlement_base_info": {
+                      "user_id": "multi-pack-user",
+                      "product_type": 3,
+                      "quota": { "credits_limit": -1 }
+                    },
+                    "usage": { "credits_amount": 40 },
+                    "expire_time": 1787500800,
+                    "display_desc": "不限量包"
+                  }
+                ]
+              }
+            }
+            """.utf8
+        )
+        let multiPackQuota = try TraeAPIParser.parseQuota(
+            multiPackQuotaData,
+            fallbackUserID: "fallback-user",
+            capturedAt: capturedAt
+        )
+        let multiPackStat = CreditStatMapper.statForTraeQuota(
+            variant: .china,
+            accountID: "china:multi-pack-user",
+            accountName: "Multi",
+            isCurrent: false,
+            sourceUserID: "multi-pack-user",
+            quota: multiPackQuota,
+            now: creditNow
+        )
+        try expect(
+            multiPackStat.packages.count == 3
+                && multiPackStat.packages[0].remaining == 300
+                && multiPackStat.packages[0].name == "会员积分"
+                && multiPackStat.packages[1].remaining == 10
+                && multiPackStat.packages[1].name == "兑换积分",
+            "Trae credit mapping carries the full package list with remaining totals"
+        )
+        try expect(
+            multiPackStat.packages[0].expireAt == Date(timeIntervalSince1970: 1_787_500_800.123),
+            "Trae package expiry handles millisecond timestamps"
+        )
+        try expect(
+            multiPackStat.packages[2].isUnlimited
+                && multiPackStat.packages[2].total == nil
+                && multiPackStat.packages[2].name == "不限量包",
+            "Trae unlimited packs map without a fake finite total"
         )
 
         // T-SR-01 + T-ISO-01：稳定排序与错误/成功共存（纯函数层）

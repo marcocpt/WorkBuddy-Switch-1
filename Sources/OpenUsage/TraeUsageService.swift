@@ -5,6 +5,14 @@ enum TraeQuotaUnit: String, Hashable, Sendable {
     case requests
 }
 
+/// 单个 Trae 权益/积分包（用于「全部积分包」明细展示）。
+struct TraeCreditPack: Hashable, Sendable {
+    let name: String
+    let limit: Double?
+    let used: Double
+    let expireAt: Date?
+}
+
 struct TraeQuotaSummary: Hashable, Sendable {
     let sourceUserID: String
     let used: Double
@@ -15,6 +23,8 @@ struct TraeQuotaSummary: Hashable, Sendable {
     let cycleStartsAt: Date?
     let resetsAt: Date?
     let capturedAt: Date
+    /// 各积分/权益包明细（credits 口径的 entitlement packs）
+    var packs: [TraeCreditPack] = []
 
     var isUnlimited: Bool { total == nil }
     var remaining: Double? { total.map { max($0 - used, 0) } }
@@ -617,6 +627,7 @@ enum TraeAPIParser {
         var requestTotal = 0.0
         var requestUnlimited = false
         var hasCreditFields = false
+        var creditPacks: [TraeCreditPack] = []
         var selected: (priority: Int, type: Int, pack: [String: Any])?
         var sourceUserID = fallbackUserID
 
@@ -652,12 +663,33 @@ enum TraeAPIParser {
                 } else {
                     finiteTotal += max(creditLimit, 0)
                 }
+                // 每个 credits 权益包计入明细（透支负数 limit 视为不限量，仅记正额）
+                creditPacks.append(
+                    TraeCreditPack(
+                        name: packName(pack),
+                        limit: creditLimit < 0 ? nil : max(creditLimit, 0),
+                        used: max(creditAmount ?? 0, 0),
+                        expireAt: packExpireDate(pack)
+                    )
+                )
             } else {
                 used += basicUsed + bonusUsed
                 if basicLimit < 0 || bonusLimit < 0 {
                     isUnlimited = true
                 } else {
                     finiteTotal += max(basicLimit, 0) + max(bonusLimit, 0)
+                }
+                if hasBasicCreditFields {
+                    creditPacks.append(
+                        TraeCreditPack(
+                            name: packName(pack),
+                            limit: (basicLimit < 0 || bonusLimit < 0)
+                                ? nil
+                                : max(basicLimit, 0) + max(bonusLimit, 0),
+                            used: basicUsed + bonusUsed,
+                            expireAt: packExpireDate(pack)
+                        )
+                    )
                 }
             }
             payGoUsed += max(number(usage["pay_go_amount"]) ?? 0, 0)
@@ -712,8 +744,25 @@ enum TraeAPIParser {
             packageName: productName(selected.type),
             cycleStartsAt: cycleStart,
             resetsAt: reset,
-            capturedAt: capturedAt
+            capturedAt: capturedAt,
+            packs: creditPacks
         )
+    }
+
+    /// 权益包展示名：display_desc / group_name 优先，缺失回退产品名。
+    private static func packName(_ pack: [String: Any]) -> String {
+        let base = dictionary(pack["entitlement_base_info"]) ?? pack
+        let productType = integer(base["product_type"]) ?? 0
+        let display = string(pack["display_desc"]) ?? string(pack["group_name"])
+        return display ?? productName(productType)
+    }
+
+    /// 权益包到期时间：expire_time → end_time → next_billing_time（均可缺省）。
+    private static func packExpireDate(_ pack: [String: Any]) -> Date? {
+        let base = dictionary(pack["entitlement_base_info"]) ?? pack
+        return date(pack["expire_time"])
+            ?? date(base["end_time"])
+            ?? date(pack["next_billing_time"])
     }
 
     static func parseUsagePage(_ data: Data) throws -> TraeUsagePage {
