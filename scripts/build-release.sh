@@ -4,7 +4,27 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 version="${OPENUSAGE_VERSION:-0.2.0}"
 build_number="${OPENUSAGE_BUILD_NUMBER:-6}"
-sign_identity="${OPENUSAGE_SIGN_IDENTITY:--}"
+local_codesign_identity="WorkBuddy Switch Local Development"
+# 优先显式环境变量；否则用稳定的本地代码签名身份（避免 ad-hoc 重签导致钥匙串反复授权）；
+# 都不存在时回退 ad-hoc 自签。身份匹配用完整引号全名（精确，避免同名子串误选）。
+if [[ -n "${OPENUSAGE_SIGN_IDENTITY:-}" ]]; then
+  sign_identity="${OPENUSAGE_SIGN_IDENTITY}"
+elif security find-identity -v -p codesigning 2>/dev/null | grep -Fq "\"${local_codesign_identity}\""; then
+  sign_identity="${local_codesign_identity}"
+else
+  sign_identity="-"
+fi
+# notarization 边界：自签身份不能用于 notarize。
+# ① 设了 notary profile 但没显式给身份（会走到 ad-hoc “-”）→ fail-fast；
+# ② 显式给的正是本地自签身份 → fail-fast。
+if [[ -n "${OPENUSAGE_NOTARY_PROFILE:-}" && -z "${OPENUSAGE_SIGN_IDENTITY:-}" ]]; then
+  echo "错误：启用 notarization（OPENUSAGE_NOTARY_PROFILE）时，必须显式设置 OPENUSAGE_SIGN_IDENTITY 为 Developer ID Application 身份。" >&2
+  exit 1
+fi
+if [[ -n "${OPENUSAGE_NOTARY_PROFILE:-}" && "${sign_identity}" == "${local_codesign_identity}" ]]; then
+  echo "错误：本地自签身份不能用于 notarization，请把 OPENUSAGE_SIGN_IDENTITY 设为非本地的 Developer ID 身份。" >&2
+  exit 1
+fi
 arch_list=(${=OPENUSAGE_ARCHS:-$(uname -m)})
 product_name="WorkBuddy Switch"
 artifact_prefix="WorkBuddy-Switch"

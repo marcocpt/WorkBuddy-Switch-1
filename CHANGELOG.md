@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Stop repeated Keychain authorization prompts after every rebuild: local and
+  development builds now prefer a stable self-signed code-signing identity
+  (`scripts/setup-local-codesign.sh`), so the app's designated requirement no
+  longer changes with each compile. Run `zsh scripts/setup-local-codesign.sh`
+  once, then `scripts/build-release.sh` signs with the stable identity
+  automatically (ad-hoc signing remains the fallback).
 - Add a credit statistics panel at the top of the Overview page: every saved
   account (WorkBuddy, Trae CN, and TRAE Work) gets its own card showing total
   remaining credits (or requests) and the expiring-soon amount with its date.
