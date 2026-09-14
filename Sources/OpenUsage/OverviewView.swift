@@ -88,12 +88,31 @@ struct OverviewView: View {
                     spacing: 12
                 ) {
                     ForEach(state.creditStats) { stat in
-                        CreditStatCard(stat: stat)
+                        CreditStatCard(
+                            stat: stat,
+                            onSwitchAccount: { switchAccount(stat) },
+                            onRefresh: {
+                                Task { await state.refreshAll(force: true) }
+                            }
+                        )
                     }
                 }
             }
         }
         .padding(.top, 18)
+    }
+
+    /// 点击积分卡图标：把该卡片账号切换为当前激活账号（当前账号禁用）。
+    /// 由 AppState.switchOverviewAccount 原子执行：先对齐 provider，再切账号，
+    /// 只触发一次刷新，避免跨 provider 错绑 usageAccountID。
+    private func switchAccount(_ stat: AccountCreditStat) {
+        Task {
+            await state.switchOverviewAccount(
+                provider: stat.provider,
+                sourceUserID: stat.sourceUserID,
+                isCurrent: stat.isCurrent
+            )
+        }
     }
 
     private var creditSkeletonCard: some View {
@@ -564,29 +583,33 @@ struct OverviewView: View {
 /// 概览页积分统计卡片：参考 changexbc/workbuddy-switch 设计。
 private struct CreditStatCard: View {
     let stat: AccountCreditStat
-    /// 即将到期预览区最多展示几条；完整列表走展开入口
+    /// 点击卡片图标切换账号（仅非当前账号可点）
+    let onSwitchAccount: () -> Void
+    /// 点击卡片刷新按钮强制刷新积分
+    let onRefresh: () -> Void
+    /// 即将到期预览区最多展示几条；完整列表走积分包详情
     private let nearExpiryPreviewLimit = 3
-    /// 控制「查看全部积分包」展开/收起状态
-    @State private var packagesExpanded = false
+    /// 控制「积分包详情」面板
+    @State private var showPackagesDetail = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            // ① 顶栏：provider 图标 + 账号名 + 当前标记 + 短ID
+            // ① 顶栏：provider 图标（切换按钮）+ 账号名 + 当前标记 + 短ID + 刷新
             headerRow
             // ② 主值 + 副标题（单位 · 包数 · 更新时间）
             if let error = stat.error {
                 errorBlock(error)
             } else {
                 mainValueBlock
-                // ③ 即将到期 TOP N 明细列表（始终展开）
+                // ③ 即将到期 TOP N 明细列表（快到期在前，始终展开）
                 if !upcomingExpiryPackages.isEmpty {
                     upcomingExpirySection
                 } else if !altExpiryText.isEmpty {
                     altExpiryRow
                 }
-                // ④ 展开入口：只要有包就始终提供完整列表入口
+                // ④ 完整积分包入口：点击打开积分包详情面板
                 if !stat.packages.isEmpty {
-                    packageDisclosure
+                    packageDetailButton
                 }
             }
         }
@@ -598,28 +621,53 @@ private struct CreditStatCard: View {
                 .stroke(OpenUsageColors.separator, lineWidth: 1)
         }
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .sheet(isPresented: $showPackagesDetail) {
+            PackageListDetailView(
+                accountName: stat.accountName.isEmpty ? accountShortID : stat.accountName,
+                packages: stat.packages
+            )
+        }
     }
 
-    // MARK: - ① 顶栏
+    // MARK: - ① 顶栏（放大 1.5 倍）
 
     private var headerRow: some View {
-        HStack(spacing: 6) {
-            Image(systemName: providerSystemImage)
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(tint)
+        HStack(spacing: 8) {
+            Button(action: onSwitchAccount) {
+                Image(systemName: providerSystemImage)
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(tint)
+                    .frame(width: 22, height: 22, alignment: .center)
+            }
+            .buttonStyle(.plain)
+            .disabled(stat.isCurrent)
+            .help(stat.isCurrent ? "当前账号" : "切换到该账号")
+            .accessibilityLabel(stat.isCurrent ? "当前账号" : "切换到该账号")
             Text(stat.accountName.isEmpty ? accountShortID : stat.accountName)
-                .font(.system(size: 12, weight: .semibold))
+                .font(.system(size: 18, weight: .semibold))
                 .lineLimit(1)
+                .minimumScaleFactor(0.7)
+                .layoutPriority(1)
             if stat.isCurrent {
                 Text("当前")
-                    .font(.system(size: 10, weight: .medium))
+                    .font(.system(size: 15, weight: .medium))
                     .foregroundStyle(OpenUsageColors.lime)
             }
             Spacer(minLength: 0)
+            Button(action: onRefresh) {
+                Image(systemName: "arrow.clockwise")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 22, height: 22, alignment: .center)
+            }
+            .buttonStyle(.plain)
+            .help("刷新全部数据和积分")
+            .accessibilityLabel("刷新全部数据和积分")
             Text(accountShortID)
-                .font(.system(size: 10))
+                .font(.system(size: 11))
                 .foregroundStyle(.tertiary)
                 .lineLimit(1)
+                .layoutPriority(0)
         }
     }
 
@@ -679,7 +727,8 @@ private struct CreditStatCard: View {
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.secondary)
             VStack(alignment: .leading, spacing: 4) {
-                ForEach(Array(upcomingExpiryPackages.prefix(nearExpiryPreviewLimit).enumerated()), id: \.offset) { _, pkg in
+                let previews = upcomingExpiryPackages.prefix(nearExpiryPreviewLimit)
+                ForEach(Array(previews.enumerated()), id: \.offset) { _, pkg in
                     upcomingExpiryRow(pkg)
                 }
             }
@@ -738,16 +787,12 @@ private struct CreditStatCard: View {
         }
     }
 
-    // MARK: - ④ 展开入口
+    // MARK: - ④ 积分包详情入口
 
-    private var packageDisclosure: some View {
-        DisclosureGroup(isExpanded: $packagesExpanded) {
-            VStack(alignment: .leading, spacing: 10) {
-                ForEach(stat.packages.indices, id: \.self) { index in
-                    CreditPackageRow(pkg: stat.packages[index])
-                }
-            }
-            .padding(.top, 6)
+    /// 最后一行：点击打开「积分包列表详情」面板（不再内嵌展开）。
+    private var packageDetailButton: some View {
+        Button {
+            showPackagesDetail = true
         } label: {
             HStack(spacing: 4) {
                 Text("查看全部积分包")
@@ -758,13 +803,14 @@ private struct CreditStatCard: View {
                 Spacer(minLength: 0)
                 Image(systemName: "chevron.right")
                     .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(.tertiary)
-                    .rotationEffect(.degrees(packagesExpanded ? 90 : 0))
-                    .animation(.easeInOut(duration: 0.15), value: packagesExpanded)
             }
-            .foregroundStyle(.secondary)
+            .padding(.vertical, 2)
+            .contentShape(Rectangle())
         }
-        .tint(.clear)
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .help("打开积分包列表详情")
+        .accessibilityLabel("打开积分包列表详情")
     }
 
     // MARK: - 计算属性
@@ -908,5 +954,59 @@ private struct CreditPackageRow: View {
         }
         parts.append("已用 \(CreditStatCard.amountText(pkg.used))")
         return parts.joined(separator: " · ")
+    }
+}
+
+/// 积分包列表详情面板：点击卡片「查看全部积分包」打开，展示完整包明细。
+private struct PackageListDetailView: View {
+    let accountName: String
+    let packages: [CreditPackage]
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("积分包列表")
+                    .font(.system(size: 15, weight: .semibold))
+                Text(accountName)
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer()
+            }
+            .padding(.bottom, 2)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    ForEach(packages.indices, id: \.self) { index in
+                        VStack(alignment: .leading, spacing: 0) {
+                            CreditPackageRow(pkg: packages[index])
+                            if index < packages.count - 1 {
+                                Divider()
+                                    .padding(.top, 10)
+                            }
+                        }
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+            }
+            .background(Color(nsColor: .controlBackgroundColor))
+            .overlay {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(OpenUsageColors.separator, lineWidth: 1)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
+        .padding(20)
+        .frame(width: 440, height: 520)
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button("关闭") {
+                    dismiss()
+                }
+                .keyboardShortcut(.cancelAction)
+            }
+        }
     }
 }

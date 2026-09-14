@@ -136,6 +136,89 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// 积分概览卡片图标点击：把某账号设为激活账号。
+    /// 与 `selectProvider + switchAccount` 交叉调用不同，这里先对齐 provider，
+    /// 再切账号，全程只触发一次 `refreshAll`，避免双刷新竞态与 usageAccountID 错绑。
+    /// 原子顺序：先解析并完成底层切换，成功后才提交 selectedProvider / usageAccountID
+    /// / UI 状态，失败时保持原页面状态不变。
+    func switchOverviewAccount( // swiftlint:disable:this function_body_length
+        provider: ManagedProvider,
+        sourceUserID: String,
+        isCurrent: Bool
+    ) async {
+        guard !isCurrent else { return }
+        guard !isAccountBackupBusy else {
+            present(
+                OpenUsageError.commandFailed("账号备份或导入正在进行，请稍后再试。"),
+                title: "操作被阻止"
+            )
+            return
+        }
+        guard resumingSessionID == nil else {
+            alert = AppAlert(
+                title: "正在准备对话",
+                message: "对话迁移或恢复完成后再切换账号。"
+            )
+            return
+        }
+        // 已有账号切换在进行时静默忽略重复点击，避免二次 invalidate / 失败弹窗
+        if isActiveAccountSwitching {
+            return
+        }
+        // 1) 底层切换：失败前不修改任何全局状态，失败即返回保持原状
+        var targetAccountID: String?
+        do {
+            switch provider {
+            case .workBuddy:
+                guard
+                    let profile = accounts.accounts.first(where: { $0.id == sourceUserID })
+                else {
+                    return
+                }
+                try await accounts.switchAccount(to: profile)
+                targetAccountID = profile.id
+            case .traeCN, .traeWork:
+                guard
+                    let variant = provider.traeVariant,
+                    let profile = traeAccounts
+                        .accounts(for: variant)
+                        .first(where: { $0.userID == sourceUserID })
+                else {
+                    return
+                }
+                try await traeAccounts.switchAccount(to: profile)
+                targetAccountID = profile.userID
+            }
+        } catch {
+            present(error, title: "切换失败")
+            return
+        }
+        guard let targetAccountID else { return }
+        // 2) 切换成功后才提交全局状态，只触发一次刷新
+        invalidateRefreshResults()
+        if provider != selectedProvider {
+            selectedProvider = provider
+            UserDefaults.standard.set(
+                provider.rawValue,
+                forKey: "selectedManagedProvider"
+            )
+            sessions = []
+            usage = .empty
+            traeQuota = nil
+            sessionMessage = provider.supportsSessions
+                ? nil
+                : "\(provider.title) 暂不支持对话浏览或恢复。"
+            usageMessage = nil
+            quotaMessage = "正在读取 \(provider.title) 用量。"
+        }
+        usageAccountID = targetAccountID
+        quota = nil
+        locallyAttributedCycleCredits = nil
+        quotaMessage = "正在刷新新账号用量。"
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        await refreshAll(force: true)
+    }
+
     func start() async {
         if let startupTask {
             await startupTask.value
