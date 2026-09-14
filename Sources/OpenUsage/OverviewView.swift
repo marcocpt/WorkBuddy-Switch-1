@@ -621,12 +621,6 @@ private struct CreditStatCard: View {
                 .stroke(OpenUsageColors.separator, lineWidth: 1)
         }
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .sheet(isPresented: $showPackagesDetail) {
-            PackageListDetailView(
-                accountName: stat.accountName.isEmpty ? accountShortID : stat.accountName,
-                packages: stat.packages
-            )
-        }
     }
 
     // MARK: - ① 顶栏（放大 1.5 倍）
@@ -789,7 +783,7 @@ private struct CreditStatCard: View {
 
     // MARK: - ④ 积分包详情入口
 
-    /// 最后一行：点击打开「积分包列表详情」面板（不再内嵌展开）。
+    /// 最后一行：点击打开「积分包列表详情」悬浮窗（popover 锚定本按钮行）。
     private var packageDetailButton: some View {
         Button {
             showPackagesDetail = true
@@ -811,6 +805,12 @@ private struct CreditStatCard: View {
         .foregroundStyle(.secondary)
         .help("打开积分包列表详情")
         .accessibilityLabel("打开积分包列表详情")
+        .popover(isPresented: $showPackagesDetail, arrowEdge: .top) {
+            PackageListDetailView(
+                accountName: stat.accountName.isEmpty ? accountShortID : stat.accountName,
+                packages: stat.packages
+            )
+        }
     }
 
     // MARK: - 计算属性
@@ -957,7 +957,7 @@ private struct CreditPackageRow: View {
     }
 }
 
-/// 积分包列表详情面板：点击卡片「查看全部积分包」打开，展示完整包明细。
+/// 积分包列表详情悬浮窗（popover）：点击卡片「查看全部积分包」打开，展示完整包明细。
 private struct PackageListDetailView: View {
     let accountName: String
     let packages: [CreditPackage]
@@ -965,7 +965,7 @@ private struct PackageListDetailView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
+            HStack(spacing: 8) {
                 Text("积分包列表")
                     .font(.system(size: 15, weight: .semibold))
                 Text(accountName)
@@ -974,6 +974,18 @@ private struct PackageListDetailView: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
                 Spacer()
+                Button {
+                    dismiss()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 18, weight: .medium))
+                        .foregroundStyle(.tertiary)
+                        .frame(width: 24, height: 24, alignment: .center)
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut(.cancelAction)
+                .help("关闭")
+                .accessibilityLabel("关闭")
             }
             .padding(.bottom, 2)
             ScrollView {
@@ -998,15 +1010,7 @@ private struct PackageListDetailView: View {
             }
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         }
-        .padding(20)
-        .frame(width: 440, height: 520)
-        .toolbar {
-            ToolbarItem(placement: .cancellationAction) {
-                Button("关闭") {
-                    dismiss()
-                }
-                .keyboardShortcut(.cancelAction)
-            }
-        }
+        .padding(16)
+        .frame(width: 420, height: 480)
     }
 }
