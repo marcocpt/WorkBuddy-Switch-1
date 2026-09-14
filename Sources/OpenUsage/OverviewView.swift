@@ -23,6 +23,10 @@ struct OverviewView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
+                if state.hasAnySavedAccount,
+                   state.isCreditStatsLoading || !state.creditStats.isEmpty {
+                    creditStatsPanel
+                }
                 hero
                 metrics
                 HStack(alignment: .top, spacing: 22) {
@@ -53,6 +57,65 @@ struct OverviewView: View {
                 .accessibilityLabel("刷新")
             }
         }
+    }
+
+    // MARK: - 积分统计
+
+    private var creditStatsPanel: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 8) {
+                Text("积分统计")
+                    .font(.system(size: 16, weight: .semibold))
+                if state.isCreditStatsLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+                Spacer()
+            }
+            .padding(.bottom, 10)
+            if state.isCreditStatsLoading && state.creditStats.isEmpty {
+                LazyVGrid(
+                    columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 4),
+                    spacing: 12
+                ) {
+                    ForEach(0..<2, id: \.self) { _ in
+                        creditSkeletonCard
+                    }
+                }
+            } else {
+                LazyVGrid(
+                    columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 4),
+                    spacing: 12
+                ) {
+                    ForEach(state.creditStats) { stat in
+                        CreditStatCard(stat: stat)
+                    }
+                }
+            }
+        }
+        .padding(.top, 18)
+    }
+
+    private var creditSkeletonCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            RoundedRectangle(cornerRadius: 4)
+                .fill(Color.primary.opacity(0.08))
+                .frame(width: 96, height: 12)
+            ProgressView()
+                .controlSize(.small)
+                .frame(width: 80, height: 24, alignment: .leading)
+            RoundedRectangle(cornerRadius: 4)
+                .fill(Color.primary.opacity(0.06))
+                .frame(height: 10)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(OpenUsageColors.separator, lineWidth: 1)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     private var hero: some View {
@@ -496,4 +559,126 @@ struct OverviewView: View {
             }
         }
     }
+}
+
+/// 概览页积分统计卡片：单个已保存账号的积分余量与到期信息。
+private struct CreditStatCard: View {
+    let stat: AccountCreditStat
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: providerSystemImage)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(tint)
+                Text(stat.accountName.isEmpty ? accountShortID : stat.accountName)
+                    .font(.system(size: 12, weight: .semibold))
+                    .lineLimit(1)
+                if stat.isCurrent {
+                    Text("当前")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(OpenUsageColors.lime)
+                }
+                Spacer(minLength: 0)
+            }
+            Text(accountShortID)
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+            if let error = stat.error {
+                Text("—")
+                    .font(.system(size: 25, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.secondary)
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 11))
+                    .foregroundStyle(OpenUsageColors.coral)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text(mainValue)
+                    .font(.system(size: 25, weight: .semibold, design: .rounded))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+                if stat.unit != .unlimited {
+                    Text(unitCaption)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                Text(expiryLine)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(OpenUsageColors.separator, lineWidth: 1)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private var accountShortID: String {
+        let id = stat.accountID
+        guard id.count > 12 else { return id }
+        return "\(id.prefix(7))...\(id.suffix(4))"
+    }
+
+    private var unitCaption: String {
+        switch stat.unit {
+        case .credits: return "总积分"
+        case .requests: return "总请求"
+        case .unlimited: return ""
+        }
+    }
+
+    private var providerSystemImage: String {
+        stat.provider.systemImage
+    }
+
+    private var tint: Color {
+        switch stat.provider {
+        case .workBuddy: return OpenUsageColors.blue
+        case .traeCN: return OpenUsageColors.coral
+        case .traeWork: return OpenUsageColors.cyan
+        }
+    }
+
+    private var mainValue: String {
+        switch stat.unit {
+        case .credits:
+            return stat.totalRemaining.map(DisplayFormat.credits) ?? "—"
+        case .requests:
+            guard let value = stat.totalRemaining else { return "—" }
+            return value.rounded() == value
+                ? String(Int(value))
+                : DisplayFormat.credits(value)
+        case .unlimited:
+            return "不限量"
+        }
+    }
+
+    private var expiryLine: String {
+        guard let date = stat.soonestExpireAt else {
+            return stat.provider == .workBuddy ? "暂无可展示的到期" : "暂无结算日期"
+        }
+        let day = Self.shortDateFormatter.string(from: date)
+        if stat.expiringSoonRemaining > 0 {
+            let amount = stat.expiringSoonRemaining.rounded() == stat.expiringSoonRemaining
+                ? String(Int(stat.expiringSoonRemaining))
+                : DisplayFormat.credits(stat.expiringSoonRemaining)
+            let unit = stat.unit == .requests ? "请求" : "积分"
+            return "近期到期 \(amount) \(unit) · \(day)"
+        }
+        let prefix = stat.provider == .workBuddy ? "最近到期" : "下次结算"
+        return "\(prefix) \(day)"
+    }
+
+    private static let shortDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "M/d"
+        return formatter
+    }()
 }

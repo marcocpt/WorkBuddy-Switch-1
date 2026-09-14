@@ -1,0 +1,335 @@
+import Foundation
+
+// MARK: - 服务层输入（只含读权限所需的最小凭据载体）
+
+/// 资源聚合结果（卡片级数值）。
+struct WorkBuddyCreditSummary: Hashable, Sendable {
+    let totalRemaining: Double
+    let expiringSoonRemaining: Double
+    let soonestExpireAt: Date?
+}
+
+/// WorkBuddy 账号积分查询输入：账号身份 + 原样凭据字节。
+struct WorkBuddyCreditAccount: Sendable {
+    let userID: String
+    let accountID: String
+    let accountName: String
+    let isCurrent: Bool
+    let authData: Data
+}
+
+/// Trae 账号积分查询输入：变体 + 快照。
+struct TraeCreditAccount: Sendable {
+    let variant: TraeVariant
+    let profileID: String
+    let userID: String
+    let accountName: String
+    let isCurrent: Bool
+    let snapshot: TraeCredentialSnapshot
+}
+
+// MARK: - 服务
+
+/// 逐账号并行拉取积分统计；单账号失败隔离为错误卡片，不阻塞其余账号。
+actor CreditStatsService {
+    private let httpClient: any CreditStatsHTTPClient
+    private let traeUsageService: TraeUsageService
+    private let maxConcurrency: Int
+    private let timeoutInterval: TimeInterval
+    private let workBuddyEndpoint: URL
+
+    init(
+        httpClient: any CreditStatsHTTPClient = URLSessionCreditStatsHTTPClient(),
+        traeUsageService: TraeUsageService = TraeUsageService(),
+        maxConcurrency: Int = 4,
+        timeoutInterval: TimeInterval = 12,
+        workBuddyEndpoint: URL = URL(
+            string: "https://www.codebuddy.cn/v2/billing/meter/get-user-resource"
+        )!
+    ) {
+        self.httpClient = httpClient
+        self.traeUsageService = traeUsageService
+        self.maxConcurrency = max(1, maxConcurrency)
+        self.timeoutInterval = max(1, timeoutInterval)
+        self.workBuddyEndpoint = workBuddyEndpoint
+    }
+
+    /// 汇总三端账号的积分统计；不抛整体错误（故障都落在卡片上）。
+    func refresh(
+        workBuddy: [WorkBuddyCreditAccount],
+        trae: [TraeCreditAccount],
+        now: Date = Date()
+    ) async -> [AccountCreditStat] {
+        var inputs: [(provider: ManagedProvider, fetch: @Sendable () async -> AccountCreditStat)] = []
+        inputs.append(contentsOf: workBuddy.map { account in
+            (
+                .workBuddy,
+                { @Sendable [self] in await self.fetchWorkBuddy(account, now: now) }
+            )
+        })
+        inputs.append(contentsOf: trae.map { account in
+            (
+                account.variant.provider,
+                { @Sendable [self] in await self.fetchTrae(account, now: now) }
+            )
+        })
+
+        var stats: [AccountCreditStat] = []
+        var offset = 0
+        while offset < inputs.count {
+            let upper = min(offset + maxConcurrency, inputs.count)
+            let batch = Array(inputs[offset..<upper])
+            let results = await withTaskGroup(
+                of: (Int, AccountCreditStat).self
+            ) { group in
+                for (batchOffset, input) in batch.enumerated() {
+                    let fetch = input.fetch
+                    group.addTask {
+                        (batchOffset, await fetch())
+                    }
+                }
+                var collected: [Int: AccountCreditStat] = [:]
+                for await item in group {
+                    collected[item.0] = item.1
+                }
+                return batch.indices.compactMap { collected[$0] }
+            }
+            stats.append(contentsOf: results)
+            offset += maxConcurrency
+        }
+        return CreditStatMapper.sort(stats)
+    }
+
+    // MARK: - WorkBuddy
+
+    private func fetchWorkBuddy(
+        _ account: WorkBuddyCreditAccount,
+        now: Date
+    ) async -> AccountCreditStat {
+        do {
+            let document = try AuthDocument(data: account.authData)
+            // 凭据身份必须与卡片身份一致，防止错绑 token 把别的账号数据标到本卡
+            guard document.userID == account.userID else {
+                throw WorkBuddyCreditError.identityMismatch
+            }
+            let token = try document.accessToken()
+            let resources = try await fetchWorkBuddyResources(
+                token: token,
+                now: now
+            )
+            let summary = WorkBuddyCreditParser.summarize(resources, now: now)
+            return baseStat(
+                provider: .workBuddy,
+                accountID: account.accountID,
+                accountName: account.accountName,
+                isCurrent: account.isCurrent,
+                sourceUserID: account.userID
+            ).resolving(
+                totalRemaining: summary.totalRemaining,
+                expiringSoonRemaining: summary.expiringSoonRemaining,
+                soonestExpireAt: summary.soonestExpireAt,
+                unit: .credits
+            )
+        } catch let error as WorkBuddyCreditError {
+            return workBuddyFailure(account, message: error.message)
+        } catch {
+            return workBuddyFailure(account, message: error.localizedDescription)
+        }
+    }
+
+    private func fetchWorkBuddyResources(
+        token: String,
+        now: Date
+    ) async throws -> [CreditResource] {
+        // fail-closed：即使注入任意端点也不得发往非官方主机
+        try WorkBuddyOfficialHostPolicy.validateRequest(workBuddyEndpoint)
+        var request = URLRequest(url: workBuddyEndpoint, timeoutInterval: timeoutInterval)
+        request.httpMethod = "POST"
+        request.httpBody = Data("{}".utf8)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("WorkBuddy", forHTTPHeaderField: "User-Agent")
+
+        let (data, response) = try await httpClient.data(for: request)
+        if response.statusCode == 401 || response.statusCode == 403 {
+            throw WorkBuddyCreditError.expired
+        }
+        guard response.statusCode == 200 else {
+            throw WorkBuddyCreditError.unavailable
+        }
+        guard
+            let root = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            throw WorkBuddyCreditError.unavailable
+        }
+        guard WorkBuddyCreditParser.hasAccounts(in: root) else {
+            throw WorkBuddyCreditError.unavailable
+        }
+        let accountRecords = WorkBuddyCreditParser.accounts(in: root)
+        // 空 Accounts 是合法成功（0 积分）；有记录但整体无法解析出任何容量数值 → 格式失败
+        if accountRecords.isEmpty {
+            return []
+        }
+        guard
+            accountRecords.contains(where: WorkBuddyCreditParser.hasParsableCapacityFields)
+        else {
+            throw WorkBuddyCreditError.unavailable
+        }
+        return accountRecords.map {
+            WorkBuddyCreditParser.resource(from: $0, now: now)
+        }
+    }
+
+    // MARK: - Trae
+
+    private func fetchTrae(
+        _ account: TraeCreditAccount,
+        now: Date
+    ) async -> AccountCreditStat {
+        do {
+            let quota = try await traeUsageService.fetchQuota(
+                snapshot: account.snapshot
+            )
+            return CreditStatMapper.statForTraeQuota(
+                variant: account.variant,
+                accountID: account.profileID,
+                accountName: account.accountName,
+                isCurrent: account.isCurrent,
+                sourceUserID: account.userID,
+                quota: quota,
+                now: now
+            )
+        } catch TraeSupportError.authenticationExpired {
+            return traeFailure(account, message: "登录已过期，请刷新登录后重试")
+        } catch {
+            return traeFailure(account, message: error.localizedDescription)
+        }
+    }
+
+    // MARK: - 卡片装配
+
+    private func baseStat(
+        provider: ManagedProvider,
+        accountID: String,
+        accountName: String,
+        isCurrent: Bool,
+        sourceUserID: String
+    ) -> AccountCreditStat {
+        AccountCreditStat(
+            provider: provider,
+            accountID: accountID,
+            accountName: accountName,
+            isCurrent: isCurrent,
+            unit: provider == .workBuddy ? .credits : .credits,
+            totalRemaining: nil,
+            expiringSoonRemaining: 0,
+            soonestExpireAt: nil,
+            error: nil,
+            sourceUserID: sourceUserID
+        )
+    }
+
+    private func workBuddyFailure(
+        _ account: WorkBuddyCreditAccount,
+        message: String
+    ) -> AccountCreditStat {
+        .failure(
+            provider: .workBuddy,
+            accountID: account.accountID,
+            accountName: account.accountName,
+            isCurrent: account.isCurrent,
+            sourceUserID: account.userID,
+            error: message
+        )
+    }
+
+    private func traeFailure(
+        _ account: TraeCreditAccount,
+        message: String
+    ) -> AccountCreditStat {
+        .failure(
+            provider: account.variant.provider,
+            accountID: account.profileID,
+            accountName: account.accountName,
+            isCurrent: account.isCurrent,
+            sourceUserID: account.userID,
+            error: message
+        )
+    }
+}
+
+// MARK: - Trae 额度 → 卡片映射 + 排序
+
+enum CreditStatMapper {
+    /// Trae 额度模型 → 卡片。Credits/请求单位决定主数值；下次结算日为过期展示。
+    static func statForTraeQuota( // swiftlint:disable:this function_parameter_count
+        variant: TraeVariant,
+        accountID: String,
+        accountName: String,
+        isCurrent: Bool,
+        sourceUserID: String,
+        quota: TraeQuotaSummary,
+        now: Date = Date()
+    ) -> AccountCreditStat {
+        let unit: CreditUsageUnit = quota.isUnlimited ? .unlimited : (quota.unit == .credits ? .credits : .requests)
+        let remaining = quota.total.map { max($0 - quota.used, 0) }
+        let soonest = quota.resetsAt
+        let expiringSoon: Double
+        if let soonest {
+            let near = soonest > now && soonest <= now.addingTimeInterval(CreditStatsRules.expiringSoonDays)
+            expiringSoon = near ? (remaining ?? 0) : 0
+        } else {
+            expiringSoon = 0
+        }
+        return AccountCreditStat(
+            provider: variant.provider,
+            accountID: accountID,
+            accountName: accountName,
+            isCurrent: isCurrent,
+            unit: unit,
+            totalRemaining: remaining,
+            expiringSoonRemaining: expiringSoon,
+            soonestExpireAt: soonest,
+            error: nil,
+            sourceUserID: sourceUserID
+        )
+    }
+
+    /// 稳定排序：WorkBuddy → Trae CN → TRAE Work；组内保持输入顺序。
+    static func sort(_ stats: [AccountCreditStat]) -> [AccountCreditStat] {
+        stats.enumerated().sorted { lhs, rhs in
+            if providerRank(lhs.element.provider) == providerRank(rhs.element.provider) {
+                return lhs.offset < rhs.offset
+            }
+            return providerRank(lhs.element.provider) < providerRank(rhs.element.provider)
+        }.map(\.element)
+    }
+
+    private static func providerRank(_ provider: ManagedProvider) -> Int {
+        switch provider {
+        case .workBuddy: return 0
+        case .traeCN: return 1
+        case .traeWork: return 2
+        }
+    }
+}
+
+enum WorkBuddyCreditError: Error {
+    case expired
+    case unavailable
+    case unsafeHost
+    case identityMismatch
+
+    var message: String {
+        switch self {
+        case .expired:
+            return "登录已过期，请刷新登录后重试"
+        case .unavailable:
+            return "积分查询失败"
+        case .unsafeHost:
+            return "积分服务地址不受信任，已停止请求"
+        case .identityMismatch:
+            return "凭据身份与账号不匹配，请重新登录并保存"
+        }
+    }
+}

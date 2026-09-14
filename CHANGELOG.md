@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Add a credit statistics panel at the top of the Overview page: every saved
+  account (WorkBuddy, Trae CN, and TRAE Work) gets its own card showing total
+  remaining credits (or requests) and the expiring-soon amount with its date.
+  WorkBuddy accounts read resource-level expiry from the billing API; Trae
+  accounts use their quota API with the next billing date. One account failing
+  (including an expired login) degrades only its own card to an inline message
+  and never blocks the rest of the overview.
+
 - Fix Trae CN usage reads after switching to an account whose login has
   expired: the app now prefers the live storage credentials maintained by the
   running Trae app, waits and retries automatically on 401/403 instead of

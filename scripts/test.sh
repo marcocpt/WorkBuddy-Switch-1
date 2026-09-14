@@ -24,6 +24,9 @@ swiftc \
   "$repo_root/Sources/OpenUsage/AccountBackupFile.swift" \
   "$repo_root/Sources/OpenUsage/AccountBackupService.swift" \
   "$repo_root/Sources/OpenUsage/TraeUsageService.swift" \
+  "$repo_root/Sources/OpenUsage/CreditStatsModels.swift" \
+  "$repo_root/Sources/OpenUsage/CreditStatsHTTP.swift" \
+  "$repo_root/Sources/OpenUsage/CreditStatsService.swift" \
   "$repo_root/Tests/SelfTest.swift" \
   -framework AppKit \
   -framework Security \

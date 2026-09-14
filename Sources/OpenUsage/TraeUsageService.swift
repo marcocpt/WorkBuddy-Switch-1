@@ -295,6 +295,25 @@ actor TraeUsageService {
         }
     }
 
+    /// 按指定账号快照拉取额度（积分统计等只读用途）。
+    /// 401/403 时仅在快照身份与 storage.json 当前身份一致才回退新凭据，
+    /// 否则原样抛出登录过期，绝不改写磁盘凭据。
+    func fetchQuota(
+        snapshot: TraeCredentialSnapshot
+    ) async throws -> TraeQuotaSummary {
+        let payload = try verifiedPayload(snapshot)
+        return try await withAuthRetry(
+            variant: snapshot.variant,
+            initial: payload,
+            expectedUserID: snapshot.userID
+        ) { payload in
+            try await self.fetchQuota(
+                payload: payload,
+                variant: snapshot.variant
+            )
+        }
+    }
+
     func fetchReport(
         snapshot: TraeCredentialSnapshot,
         range: UsageDateRange

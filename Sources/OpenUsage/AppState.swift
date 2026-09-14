@@ -27,12 +27,15 @@ final class AppState: ObservableObject {
     @Published var usageAccountID: String?
     @Published var alert: AppAlert?
     @Published private(set) var isAccountBackupBusy = false
+    @Published private(set) var creditStats: [AccountCreditStat] = []
+    @Published private(set) var isCreditStatsLoading = false
 
     let accounts = AccountStore()
     let traeAccounts = TraeAccountStore()
     private let sessionStore = SessionStore()
     private let usageService = UsageService()
     private let traeUsageService = TraeUsageService()
+    private let creditStatsService = CreditStatsService()
     private let workBuddy = WorkBuddyController()
     private let accountBackup = AccountBackupService()
     private var startupTask: Task<Void, Never>?
@@ -41,6 +44,7 @@ final class AppState: ObservableObject {
     private var refreshGeneration: UInt64 = 0
     private var sessionGeneration: UInt64 = 0
     private var usageGeneration: UInt64 = 0
+    private var creditStatsGeneration: UInt64 = 0
 
     init() {
         let today = Calendar.current.startOfDay(for: Date())
@@ -186,8 +190,13 @@ final class AppState: ObservableObject {
     }
 
     func refreshAll(force: Bool = false) async {
+        // 积分统计与用量/额度并行刷新，不阻塞概览主流程
+        let creditTask = Task { @MainActor [weak self] in
+            await self?.refreshCreditStats()
+        }
         if let variant = selectedTraeVariant {
             await refreshTraeAll(variant: variant, force: force)
+            _ = await creditTask.value
             return
         }
 
@@ -280,6 +289,116 @@ final class AppState: ObservableObject {
             locallyAttributedCycleCredits = nil
             quotaMessage = error.localizedDescription
         }
+
+        // 统一完成语义：与 Trae 分支一致，await 本次并发启动的积分刷新
+        _ = await creditTask.value
+    }
+
+    /// 全量刷新已保存账号的积分统计（三端，逐账号一张卡）。
+    /// 单账号失败由服务层转成错误卡片；凭据缺失直接置错误卡；代际校验丢弃过期结果。
+    private func refreshCreditStats() async {
+        creditStatsGeneration &+= 1
+        let generation = creditStatsGeneration
+        isCreditStatsLoading = true
+        defer {
+            if creditStatsGeneration == generation {
+                isCreditStatsLoading = false
+            }
+        }
+
+        var workBuddyInputs: [WorkBuddyCreditAccount] = []
+        var directFailures: [AccountCreditStat] = []
+        for profile in accounts.accounts {
+            let isCurrent = profile.id == accounts.currentUserID
+            if isCurrent {
+                guard let document = try? AuthDocument.loadActive() else {
+                    directFailures.append(
+                        .failure(
+                            provider: .workBuddy,
+                            accountID: profile.id,
+                            accountName: profile.nickname,
+                            isCurrent: true,
+                            sourceUserID: profile.id,
+                            error: "无法读取当前 WorkBuddy 登录信息"
+                        )
+                    )
+                    continue
+                }
+                workBuddyInputs.append(
+                    WorkBuddyCreditAccount(
+                        userID: profile.id,
+                        accountID: profile.id,
+                        accountName: profile.nickname,
+                        isCurrent: true,
+                        authData: document.rawData
+                    )
+                )
+            } else if let stored = try? accounts.credentialData(for: profile.id) {
+                workBuddyInputs.append(
+                    WorkBuddyCreditAccount(
+                        userID: profile.id,
+                        accountID: profile.id,
+                        accountName: profile.nickname,
+                        isCurrent: false,
+                        authData: stored
+                    )
+                )
+            } else {
+                directFailures.append(
+                    .failure(
+                        provider: .workBuddy,
+                        accountID: profile.id,
+                        accountName: profile.nickname,
+                        isCurrent: false,
+                        sourceUserID: profile.id,
+                        error: "凭据不可用，请重新登录并保存"
+                    )
+                )
+            }
+        }
+
+        var traeInputs: [TraeCreditAccount] = []
+        for variant in TraeVariant.allCases {
+            let currentUserID = traeAccounts.currentUserID(for: variant)
+            for profile in traeAccounts.accounts(for: variant) {
+                let isCurrent = profile.userID == currentUserID
+                guard
+                    let snapshot = try? traeAccounts.snapshot(
+                        for: variant,
+                        userID: profile.userID
+                    )
+                else {
+                    directFailures.append(
+                        .failure(
+                            provider: variant.provider,
+                            accountID: profile.id,
+                            accountName: profile.nickname,
+                            isCurrent: isCurrent,
+                            sourceUserID: profile.userID,
+                            error: "凭据快照不可用，请重新登录并保存"
+                        )
+                    )
+                    continue
+                }
+                traeInputs.append(
+                    TraeCreditAccount(
+                        variant: variant,
+                        profileID: profile.id,
+                        userID: profile.userID,
+                        accountName: profile.nickname,
+                        isCurrent: isCurrent,
+                        snapshot: snapshot
+                    )
+                )
+            }
+        }
+
+        let fetched = await creditStatsService.refresh(
+            workBuddy: workBuddyInputs,
+            trae: traeInputs
+        )
+        guard creditStatsGeneration == generation else { return }
+        creditStats = CreditStatMapper.sort(fetched + directFailures)
     }
 
     func recalculateUsage() async {
@@ -1067,7 +1186,9 @@ final class AppState: ObservableObject {
     private func invalidateRefreshResults() {
         refreshGeneration &+= 1
         usageGeneration &+= 1
+        creditStatsGeneration &+= 1
         isRefreshing = false
+        isCreditStatsLoading = false
     }
 
     /// 备份文件安全写入：同目录临时文件 0600 创建 → 权限确认 → 原子替换作为最后一步。

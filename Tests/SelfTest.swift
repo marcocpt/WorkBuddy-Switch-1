@@ -3087,6 +3087,766 @@ enum OpenUsageSelfTest {
             )
         }
 
+        // MARK: - 概览页积分统计：解析层（Phase 1）
+
+        let creditNow = Date(timeIntervalSince1970: 1_750_000_000)
+
+        // T-PR-01：precise 优先、fallback 回退、缺失时由 remaining+used 推导
+        let preciseResource = WorkBuddyCreditParser.resource(
+            from: [
+                "CycleCapacityRemainPrecise": "599.0400001",
+                "CycleCapacityRemain": 599,
+                "CycleCapacityUsedPrecise": "25.25"
+            ],
+            now: creditNow
+        )
+        try expect(
+            abs(preciseResource.remaining - 599.0400001) < 0.000_000_01
+                && abs(preciseResource.used - 25.25) < 0.000_000_01
+                && abs(preciseResource.total - 624.2900001) < 0.000_000_01,
+            "credit parser prefers precise values and derives the total"
+        )
+        let zeroPreciseResource = WorkBuddyCreditParser.resource(
+            from: [
+                "CycleCapacityRemainPrecise": "0",
+                "CycleCapacityRemain": 599
+            ],
+            now: creditNow
+        )
+        try expect(
+            zeroPreciseResource.remaining == 0,
+            "credit parser keeps an explicit zero over a legacy fallback value"
+        )
+        let fallbackResource = WorkBuddyCreditParser.resource(
+            from: [
+                "CycleCapacitySize": 2800,
+                "CycleCapacityRemain": 1300,
+                "CycleCapacityUsed": 1500
+            ],
+            now: creditNow
+        )
+        try expect(
+            fallbackResource.total == 2800
+                && fallbackResource.remaining == 1300
+                && fallbackResource.used == 1500,
+            "credit parser falls back to legacy capacity fields"
+        )
+
+        // T-PR-02：到期时间多格式解析（字符串由 creditNow 派生态，验证格式容错）
+        let isoFormat = ISO8601DateFormatter()
+        let localDateTimeFormatter = DateFormatter()
+        localDateTimeFormatter.locale = Locale(identifier: "en_US_POSIX")
+        localDateTimeFormatter.timeZone = .current
+        localDateTimeFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let msTimestamp = WorkBuddyCreditParser.timestamp(
+            NSNumber(value: creditNow.timeIntervalSince1970 * 1_000)
+        )
+        let secondTimestamp = WorkBuddyCreditParser.timestamp(
+            NSNumber(value: creditNow.timeIntervalSince1970)
+        )
+        let isoTimestamp = WorkBuddyCreditParser.timestamp(
+            isoFormat.string(from: creditNow)
+        )
+        let dateTimeTimestamp = WorkBuddyCreditParser.timestamp(
+            localDateTimeFormatter.string(from: creditNow)
+        )
+        try expect(
+            msTimestamp == creditNow
+                && secondTimestamp == creditNow
+                && isoTimestamp == creditNow
+                && dateTimeTimestamp == creditNow,
+            "credit expiry parses milliseconds, seconds, ISO8601, and date-time strings"
+        )
+        let dateOnlyFormatter = DateFormatter()
+        dateOnlyFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dateOnlyFormatter.timeZone = .current
+        dateOnlyFormatter.dateFormat = "yyyy-MM-dd"
+        let nextDay = Calendar.current.date(
+            byAdding: .day,
+            value: 1,
+            to: creditNow
+        )!
+        let dateOnly = WorkBuddyCreditParser.timestamp(
+            dateOnlyFormatter.string(from: nextDay)
+        )
+        guard let dateOnly else {
+            throw SelfTestFailure(
+                message: "date-only credit expiry must parse",
+                file: #filePath,
+                line: #line
+            )
+        }
+        try expect(
+            Calendar.current.isDate(dateOnly, inSameDayAs: nextDay)
+                && Calendar.current.component(.hour, from: dateOnly) == 23
+                && Calendar.current.component(.minute, from: dateOnly) == 59,
+            "date-only credit expiry resolves to the end of the day"
+        )
+
+        // T-PR-03 / T-PR-04：expiringSoon 与 expired 边界
+        let nearExpiry = WorkBuddyCreditParser.resource(
+            from: [
+                "CycleCapacityRemainPrecise": "80",
+                "DeductionEndTime": String(
+                    Int(creditNow.timeIntervalSince1970) + 6 * 24 * 3600
+                )
+            ],
+            now: creditNow
+        )
+        try expect(
+            nearExpiry.expiringSoon && !nearExpiry.expired,
+            "credit within 7 days and remaining is expiring soon"
+        )
+        let boundaryExpiry = WorkBuddyCreditParser.resource(
+            from: [
+                "CycleCapacityRemainPrecise": "10",
+                "CycleEndTime": String(
+                    Int(creditNow.timeIntervalSince1970) + 7 * 24 * 3600
+                )
+            ],
+            now: creditNow
+        )
+        try expect(
+            boundaryExpiry.expiringSoon,
+            "credit exactly 7 days out still counts as expiring soon"
+        )
+        let farExpiry = WorkBuddyCreditParser.resource(
+            from: [
+                "CycleCapacityRemainPrecise": "50",
+                "DeductionEndTime": String(
+                    Int(creditNow.timeIntervalSince1970) + 8 * 24 * 3600
+                )
+            ],
+            now: creditNow
+        )
+        try expect(
+            !farExpiry.expiringSoon && !farExpiry.expired,
+            "credit beyond 7 days is neither expiring soon nor expired"
+        )
+        let alreadyExpired = WorkBuddyCreditParser.resource(
+            from: [
+                "CycleCapacityRemainPrecise": "30",
+                "DeductionEndTime": String(
+                    Int(creditNow.timeIntervalSince1970) - 60
+                )
+            ],
+            now: creditNow
+        )
+        try expect(
+            alreadyExpired.expired && !alreadyExpired.expiringSoon,
+            "credit with remaining after its expiry is marked expired"
+        )
+
+        // T-PR-05：汇总求和与近期到期过滤
+        let summary = WorkBuddyCreditParser.summarize(
+            [nearExpiry, farExpiry, alreadyExpired],
+            now: creditNow
+        )
+        try expect(
+            abs(summary.totalRemaining - 160) < 0.000_001
+                && abs(summary.expiringSoonRemaining - 80) < 0.000_001
+                && summary.soonestExpireAt == alreadyExpired.expireAt,
+            "credit summary sums totals and filters expiring-soon resources"
+        )
+
+        // T-PR-06：响应路径容错（两种嵌套形状一致）
+        let nestedAccountsJSON = Data(
+            """
+            {
+              "code": 0,
+              "data": {
+                "Response": {
+                  "Data": {
+                    "Accounts": [
+                      { "PackageName": "基础包", "CycleCapacityRemainPrecise": "100" }
+                    ]
+                  }
+                }
+              }
+            }
+            """.utf8
+        )
+        let topLevelAccountsJSON = Data(
+            """
+            {
+              "code": 0,
+              "data": {
+                "Accounts": [
+                  { "PackageName": "基础包", "CycleCapacityRemainPrecise": "100" }
+                ]
+              }
+            }
+            """.utf8
+        )
+        func creditResources(_ data: Data) throws -> [CreditResource] {
+            let object = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+            return WorkBuddyCreditParser.accounts(in: object).map {
+                WorkBuddyCreditParser.resource(from: $0, now: creditNow)
+            }
+        }
+        let nestedAccounts = try creditResources(nestedAccountsJSON)
+        let topLevelAccounts = try creditResources(topLevelAccountsJSON)
+        try expect(
+            nestedAccounts.count == 1
+                && topLevelAccounts.count == 1
+                && nestedAccounts[0] == topLevelAccounts[0]
+                && nestedAccounts[0].packageName == "基础包"
+                && nestedAccounts[0].remaining == 100,
+            "credit parser tolerates legacy nested and top-level account shapes"
+        )
+
+        // T-PR-07：空 Accounts 为合法成功（空资源列表，非错误）
+        let emptyAccountsJSON = Data(
+            """
+            { "code": 0, "data": { "Accounts": [] } }
+            """.utf8
+        )
+        let emptyObject = try JSONSerialization.jsonObject(
+            with: emptyAccountsJSON
+        ) as! [String: Any]
+        try expect(
+            WorkBuddyCreditParser.hasAccounts(in: emptyObject)
+                && WorkBuddyCreditParser.accounts(in: emptyObject).isEmpty,
+            "credit parser treats an empty Accounts array as a valid success"
+        )
+        let emptySummary = WorkBuddyCreditParser.summarize([], now: creditNow)
+        try expect(
+            emptySummary.totalRemaining == 0
+                && emptySummary.expiringSoonRemaining == 0
+                && emptySummary.soonestExpireAt == nil,
+            "empty credit resources summarize to zero"
+        )
+
+        // T-PR-08：缺少可用字段的记录应判定为「格式无法识别」，不得伪装成合法的 0 成功
+        let unrecognizedRecord: [String: Any] = ["PackageName": "no-fields"]
+        let brokenResource = WorkBuddyCreditParser.resource(
+            from: unrecognizedRecord,
+            now: creditNow
+        )
+        try expect(
+            !WorkBuddyCreditParser.hasParsableCapacityFields(unrecognizedRecord)
+                && brokenResource.total == 0
+                && brokenResource.remaining == 0
+                && brokenResource.expireAt == nil
+                && !brokenResource.expired
+                && !brokenResource.expiringSoon,
+            "a record without any capacity field is flagged as unrecognized"
+        )
+        let zeroCapacityRecord: [String: Any] = [
+            "CycleCapacityRemainPrecise": "0",
+            "CycleCapacitySizePrecise": "0"
+        ]
+        try expect(
+            WorkBuddyCreditParser.hasParsableCapacityFields(zeroCapacityRecord),
+            "an explicit zero capacity still parses as a recognized field"
+        )
+        let unparsableCapacityRecord: [String: Any] = [
+            "CycleCapacityRemainPrecise": "abc"
+        ]
+        try expect(
+            !WorkBuddyCreditParser.hasParsableCapacityFields(unparsableCapacityRecord),
+            "a capacity key whose value cannot parse does not count as recognized"
+        )
+
+        // T-TR-01：Trae Credits 单位映射
+        let traeCreditsQuota = TraeQuotaSummary(
+            sourceUserID: "shared-fixture-user",
+            used: 20,
+            total: 120,
+            payGoUsed: 0,
+            unit: .credits,
+            packageName: "Pro",
+            cycleStartsAt: creditNow,
+            resetsAt: creditNow.addingTimeInterval(3 * 24 * 3600),
+            capturedAt: creditNow
+        )
+        let traeCreditsStat = CreditStatMapper.statForTraeQuota(
+            variant: .china,
+            accountID: "china:shared-fixture-user",
+            accountName: "CN Account",
+            isCurrent: true,
+            sourceUserID: "shared-fixture-user",
+            quota: traeCreditsQuota,
+            now: creditNow
+        )
+        try expect(
+            traeCreditsStat.provider == .traeCN
+                && traeCreditsStat.unit == .credits
+                && traeCreditsStat.totalRemaining == 100
+                && traeCreditsStat.soonestExpireAt == traeCreditsQuota.resetsAt,
+            "Trae credit quota maps to a credits card with remaining total"
+        )
+
+        // T-TR-02：Trae 不限量
+        let traeUnlimitedQuota = TraeQuotaSummary(
+            sourceUserID: "unlimited-user",
+            used: 45,
+            total: nil,
+            payGoUsed: 2.5,
+            unit: .credits,
+            packageName: "Ultra",
+            cycleStartsAt: creditNow,
+            resetsAt: creditNow.addingTimeInterval(10 * 24 * 3600),
+            capturedAt: creditNow
+        )
+        let traeUnlimitedStat = CreditStatMapper.statForTraeQuota(
+            variant: .work,
+            accountID: "work:unlimited-user",
+            accountName: "Ultra",
+            isCurrent: false,
+            sourceUserID: "unlimited-user",
+            quota: traeUnlimitedQuota,
+            now: creditNow
+        )
+        try expect(
+            traeUnlimitedStat.provider == .traeWork
+                && traeUnlimitedStat.unit == .unlimited
+                && traeUnlimitedStat.totalRemaining == nil
+                && traeUnlimitedStat.expiringSoonRemaining == 0,
+            "unlimited Trae quota maps to an unlimited card without a finite total"
+        )
+
+        // T-TR-03：Trae 请求计费单位
+        let traeRequestQuota = TraeQuotaSummary(
+            sourceUserID: "request-user",
+            used: 3,
+            total: 10,
+            payGoUsed: 0,
+            unit: .requests,
+            packageName: "Pro",
+            cycleStartsAt: nil,
+            resetsAt: creditNow.addingTimeInterval(20 * 24 * 3600),
+            capturedAt: creditNow
+        )
+        let traeRequestStat = CreditStatMapper.statForTraeQuota(
+            variant: .china,
+            accountID: "china:request-user",
+            accountName: "Req",
+            isCurrent: false,
+            sourceUserID: "request-user",
+            quota: traeRequestQuota,
+            now: creditNow
+        )
+        try expect(
+            traeRequestStat.unit == .requests
+                && traeRequestStat.totalRemaining == 7,
+            "request-count Trae quota maps to a requests card"
+        )
+
+        // T-TR-04：resetsAt 在 7 天内 → 近期到期；超出 → 0
+        let nearResetQuota = TraeQuotaSummary(
+            sourceUserID: "near-reset-user",
+            used: 30,
+            total: 50,
+            payGoUsed: 0,
+            unit: .credits,
+            packageName: "Pro",
+            cycleStartsAt: creditNow,
+            resetsAt: creditNow.addingTimeInterval(5 * 24 * 3600),
+            capturedAt: creditNow
+        )
+        let nearResetStat = CreditStatMapper.statForTraeQuota(
+            variant: .china,
+            accountID: "china:near-reset-user",
+            accountName: "Near",
+            isCurrent: false,
+            sourceUserID: "near-reset-user",
+            quota: nearResetQuota,
+            now: creditNow
+        )
+        let farResetStat = CreditStatMapper.statForTraeQuota(
+            variant: .china,
+            accountID: "china:near-reset-user",
+            accountName: "Near",
+            isCurrent: false,
+            sourceUserID: "near-reset-user",
+            quota: TraeQuotaSummary(
+                sourceUserID: "near-reset-user",
+                used: 30,
+                total: 50,
+                payGoUsed: 0,
+                unit: .credits,
+                packageName: "Pro",
+                cycleStartsAt: creditNow,
+                resetsAt: creditNow.addingTimeInterval(9 * 24 * 3600),
+                capturedAt: creditNow
+            ),
+            now: creditNow
+        )
+        try expect(
+            nearResetStat.expiringSoonRemaining == 20
+                && farResetStat.expiringSoonRemaining == 0,
+            "Trae expiring-soon credits follow the 7-day horizon"
+        )
+
+        // T-SR-01 + T-ISO-01：稳定排序与错误/成功共存（纯函数层）
+        let wbStat = AccountCreditStat.workBuddy(
+            accountID: "wb-user-1",
+            accountName: "WB",
+            isCurrent: true,
+            sourceUserID: "wb-user-1"
+        ).resolving(
+            totalRemaining: 200,
+            expiringSoonRemaining: 60,
+            soonestExpireAt: creditNow.addingTimeInterval(2 * 24 * 3600),
+            unit: .credits
+        )
+        let wbErrorStat = AccountCreditStat.failure(
+            provider: .workBuddy,
+            accountID: "wb-user-2",
+            accountName: "WB2",
+            isCurrent: false,
+            sourceUserID: "wb-user-2",
+            error: "登录已过期"
+        )
+        let sortedStats = CreditStatMapper.sort([
+            wbStat, wbErrorStat, traeCreditsStat, traeRequestStat
+        ])
+        try expect(
+            sortedStats.map(\.accountID)
+                == ["wb-user-1", "wb-user-2", "china:shared-fixture-user", "china:request-user"],
+            "credit cards sort WorkBuddy before Trae and preserve group order"
+        )
+        try expect(
+            sortedStats.first(where: { $0.accountID == "wb-user-2" })?.error == "登录已过期"
+                && sortedStats.first(where: { $0.accountID == "wb-user-1" })?.totalRemaining == 200,
+            "a failing account card coexists with healthy cards without corrupting them"
+        )
+
+        // MARK: - 概览页积分统计：服务层隔离（Phase 2）
+
+        let isoNow = Date(timeIntervalSince1970: 1_750_000_000)
+        let wbGoodAccount = Data(
+            """
+            {
+              "account": { "uid": "wb-good", "nickname": "WB Good" },
+              "auth": { "accessToken": "wb-good-token" }
+            }
+            """.utf8
+        )
+        let wbBadAccount = Data(
+            """
+            {
+              "account": { "uid": "wb-bad", "nickname": "WB Bad" },
+              "auth": { "accessToken": "wb-bad-token" }
+            }
+            """.utf8
+        )
+        func billingPayload(_ remaining: Double, daysOut: Int) -> Data {
+            let object: [String: Any] = [
+                "code": 0,
+                "data": [
+                    "Accounts": [
+                        [
+                            "PackageName": "基础包",
+                            "CycleCapacityRemainPrecise": String(remaining),
+                            "DeductionEndTime": String(
+                                Int(isoNow.timeIntervalSince1970) + daysOut * 24 * 3600
+                            )
+                        ]
+                    ]
+                ]
+            ]
+            let data = try! JSONSerialization.data(withJSONObject: object)
+            return data
+        }
+
+        // T-ISO-01（主体）：两个 WorkBuddy 账号中一个过期 → 仅其卡片失败
+        let wbCreditClient = FixtureCreditStatsHTTPClient(
+            byBearerToken: [
+                "wb-good-token": FixtureTraeHTTPResponse(
+                    data: billingPayload(120, daysOut: 2)
+                ),
+                "wb-bad-token": FixtureTraeHTTPResponse(
+                    data: Data(),
+                    statusCode: 401
+                )
+            ]
+        )
+        let wbIsoService = CreditStatsService(
+            httpClient: wbCreditClient
+        )
+        let wbIsoStats = await wbIsoService.refresh(
+            workBuddy: [
+                WorkBuddyCreditAccount(
+                    userID: "wb-good",
+                    accountID: "wb-good",
+                    accountName: "WB Good",
+                    isCurrent: true,
+                    authData: wbGoodAccount
+                ),
+                WorkBuddyCreditAccount(
+                    userID: "wb-bad",
+                    accountID: "wb-bad",
+                    accountName: "WB Bad",
+                    isCurrent: false,
+                    authData: wbBadAccount
+                )
+            ],
+            trae: [],
+            now: isoNow
+        )
+        let wbGoodStat = wbIsoStats.first { $0.accountID == "wb-good" }
+        let wbBadStat = wbIsoStats.first { $0.accountID == "wb-bad" }
+        try expect(
+            wbGoodStat?.totalRemaining == 120
+                && wbGoodStat?.unit == .credits
+                && wbGoodStat?.expiringSoonRemaining == 120
+                && wbGoodStat?.error == nil
+                && wbGoodStat?.isCurrent == true,
+            "a healthy WorkBuddy credit card carries its total and near-expiry credits"
+        )
+        try expect(
+            wbBadStat?.totalRemaining == nil
+                && wbBadStat?.error == "登录已过期，请刷新登录后重试",
+            "an expired WorkBuddy account degrades to an inline error card only"
+        )
+
+        // T-ISO-01b（M-01）：凭据身份错绑 → 错误卡，且不发任何请求
+        let wbMismatchClient = FixtureCreditStatsHTTPClient(
+            byBearerToken: [
+                "wb-good-token": FixtureTraeHTTPResponse(
+                    data: billingPayload(120, daysOut: 2)
+                )
+            ]
+        )
+        let wbMismatchStats = await CreditStatsService(
+            httpClient: wbMismatchClient
+        ).refresh(
+            workBuddy: [
+                WorkBuddyCreditAccount(
+                    userID: "wb-good",
+                    accountID: "wb-good",
+                    accountName: "WB Good",
+                    isCurrent: true,
+                    authData: wbGoodAccount
+                ),
+                WorkBuddyCreditAccount(
+                    userID: "expected-other-user",
+                    accountID: "expected-other-user",
+                    accountName: "WB Mismatch",
+                    isCurrent: false,
+                    authData: wbGoodAccount
+                )
+            ],
+            trae: [],
+            now: isoNow
+        )
+        let mismatchStat = wbMismatchStats.first {
+            $0.accountID == "expected-other-user"
+        }
+        try expect(
+            mismatchStat?.error == "凭据身份与账号不匹配，请重新登录并保存"
+                && mismatchStat?.totalRemaining == nil,
+            "a WorkBuddy credential bound to a different account degrades its own card"
+        )
+        let mismatchRequestCount = await wbMismatchClient.capturedRequestCount()
+        try expect(
+            mismatchRequestCount == 1,
+            "identity-mismatched WorkBuddy account never sends a request"
+        )
+
+        // T-ISO-01c（H-03）：存在 Accounts 但无任何容量字段 → 整卡失败，不展示伪造的 0
+        let wbUnrecognizedClient = FixtureCreditStatsHTTPClient(
+            byBearerToken: [
+                "wb-good-token": FixtureTraeHTTPResponse(
+                    data: try JSONSerialization.data(
+                        withJSONObject: [
+                            "code": 0,
+                            "data": [
+                                "Accounts": [["PackageName": "unknown-shape"]]
+                            ]
+                        ]
+                    )
+                )
+            ]
+        )
+        let wbUnrecognizedStats = await CreditStatsService(
+            httpClient: wbUnrecognizedClient
+        ).refresh(
+            workBuddy: [
+                WorkBuddyCreditAccount(
+                    userID: "wb-good",
+                    accountID: "wb-good",
+                    accountName: "WB Good",
+                    isCurrent: true,
+                    authData: wbGoodAccount
+                )
+            ],
+            trae: [],
+            now: isoNow
+        )
+        try expect(
+            wbUnrecognizedStats.first?.error == "积分查询失败"
+                && wbUnrecognizedStats.first?.totalRemaining == nil,
+            "an unrecognized credit response fails the card instead of faking zero"
+        )
+
+        // T-ISO-01e（H-03）：空 Accounts 是合法成功 → 0 积分卡，而非失败
+        let wbEmptyClient = FixtureCreditStatsHTTPClient(
+            byBearerToken: [
+                "wb-good-token": FixtureTraeHTTPResponse(
+                    data: try JSONSerialization.data(
+                        withJSONObject: [
+                            "code": 0,
+                            "data": ["Accounts": []]
+                        ]
+                    )
+                )
+            ]
+        )
+        let wbEmptyStats = await CreditStatsService(
+            httpClient: wbEmptyClient
+        ).refresh(
+            workBuddy: [
+                WorkBuddyCreditAccount(
+                    userID: "wb-good",
+                    accountID: "wb-good",
+                    accountName: "WB Good",
+                    isCurrent: true,
+                    authData: wbGoodAccount
+                )
+            ],
+            trae: [],
+            now: isoNow
+        )
+        try expect(
+            wbEmptyStats.first?.totalRemaining == 0
+                && wbEmptyStats.first?.expiringSoonRemaining == 0
+                && wbEmptyStats.first?.error == nil,
+            "an empty Accounts array is a valid success with zero credits"
+        )
+
+        // T-ISO-01d（H-01）：非官方主机端点被 fail-closed，直接转错误卡
+        let wbUnsafeStats = await CreditStatsService(
+            httpClient: wbCreditClient,
+            workBuddyEndpoint: URL(string: "https://attacker.example/billing")!
+        ).refresh(
+            workBuddy: [
+                WorkBuddyCreditAccount(
+                    userID: "wb-good",
+                    accountID: "wb-good",
+                    accountName: "WB Good",
+                    isCurrent: true,
+                    authData: wbGoodAccount
+                )
+            ],
+            trae: [],
+            now: isoNow
+        )
+        try expect(
+            wbUnsafeStats.first?.error == "积分服务地址不受信任，已停止请求"
+                && wbUnsafeStats.first?.totalRemaining == nil,
+            "an unapproved credit endpoint is rejected before any fetch runs"
+        )
+
+        // T-ISO-01（Trae 侧）：单账号 401 → 登录过期卡片；单账号成功 → 正常卡片
+        let isoTraeDirectory = directory.appendingPathComponent(
+            "credit-stats-temp",
+            isDirectory: true
+        )
+        let isoTraeGoodAuth = try fixtureTraeAuth(
+            userID: "t-good",
+            token: "t-good-token",
+            host: "api.trae.cn",
+            displayName: "T Good",
+            keyByte: 41
+        )
+        let isoTraeGoodSnapshot = TraeCredentialSnapshot(
+            variant: .china,
+            userID: "t-good",
+            authBlob: isoTraeGoodAuth.blob,
+            userTagBlob: nil,
+            deviceAuthBlobs: [:],
+            capturedAt: isoNow
+        )
+        let isoTraeGoodClient = FixtureTraeHTTPClient(
+            pathResponses: [
+                "quota": [
+                    FixtureTraeHTTPResponse(data: traeQuotaData)
+                ]
+            ]
+        )
+        let isoTraeGoodService = TraeUsageService(
+            client: isoTraeGoodClient,
+            storageURL: { _ in isoTraeDirectory },
+            authRetryDelayNanoseconds: 0
+        )
+        let isoTraeGoodStats = await CreditStatsService(
+            traeUsageService: isoTraeGoodService
+        ).refresh(
+            workBuddy: [],
+            trae: [
+                TraeCreditAccount(
+                    variant: .china,
+                    profileID: "china:t-good",
+                    userID: "t-good",
+                    accountName: "T Good",
+                    isCurrent: false,
+                    snapshot: isoTraeGoodSnapshot
+                )
+            ],
+            now: isoNow
+        )
+        let tGoodStat = isoTraeGoodStats.first { $0.accountID == "china:t-good" }
+        try expect(
+            tGoodStat?.provider == .traeCN
+                && tGoodStat?.error == nil
+                && tGoodStat?.totalRemaining == nil
+                && tGoodStat?.unit == .unlimited,
+            "a healthy Trae credit card reflects the parsed quota"
+        )
+
+        let isoTraeBadAuth = try fixtureTraeAuth(
+            userID: "t-bad",
+            token: "t-bad-token",
+            host: "api.trae.cn",
+            displayName: "T Bad",
+            keyByte: 42
+        )
+        let isoTraeBadSnapshot = TraeCredentialSnapshot(
+            variant: .china,
+            userID: "t-bad",
+            authBlob: isoTraeBadAuth.blob,
+            userTagBlob: nil,
+            deviceAuthBlobs: [:],
+            capturedAt: isoNow
+        )
+        let isoTraeBadClient = FixtureTraeHTTPClient(
+            responses: [
+                FixtureTraeHTTPResponse(data: Data(), statusCode: 401),
+                FixtureTraeHTTPResponse(data: Data(), statusCode: 401)
+            ]
+        )
+        let isoTraeBadService = TraeUsageService(
+            client: isoTraeBadClient,
+            storageURL: { _ in isoTraeDirectory },
+            authRetryDelayNanoseconds: 0,
+            maxAuthRetries: 1
+        )
+        let isoTraeBadStats = await CreditStatsService(
+            traeUsageService: isoTraeBadService
+        ).refresh(
+            workBuddy: [],
+            trae: [
+                TraeCreditAccount(
+                    variant: .china,
+                    profileID: "china:t-bad",
+                    userID: "t-bad",
+                    accountName: "T Bad",
+                    isCurrent: false,
+                    snapshot: isoTraeBadSnapshot
+                )
+            ],
+            now: isoNow
+        )
+        let tBadStat = isoTraeBadStats.first { $0.accountID == "china:t-bad" }
+        try expect(
+            tBadStat?.error == "登录已过期，请刷新登录后重试"
+                && tBadStat?.totalRemaining == nil,
+            "an expired Trae account degrades to an inline error card"
+        )
+
         print("OpenUsage self-test passed: \(assertions) assertions")
     }
 }
@@ -3190,6 +3950,44 @@ private actor FixtureTraeHTTPClient: TraeHTTPClient {
 
     func requestCount() -> Int {
         requests.count
+    }
+}
+
+private actor FixtureCreditStatsHTTPClient: CreditStatsHTTPClient {
+    private let byBearerToken: [String: FixtureTraeHTTPResponse]
+    private var requestCount = 0
+
+    init(byBearerToken: [String: FixtureTraeHTTPResponse]) {
+        self.byBearerToken = byBearerToken
+    }
+
+    func data(
+        for request: URLRequest
+    ) async throws -> (Data, HTTPURLResponse) {
+        requestCount += 1
+        let authorization = request.allHTTPHeaderFields?["Authorization"] ?? ""
+        let token = authorization.hasPrefix("Bearer ")
+            ? String(authorization.dropFirst("Bearer ".count))
+            : authorization
+        guard let fixture = byBearerToken[token] else {
+            throw FixtureTraeHTTPError.missingResponse
+        }
+        guard
+            let responseURL = fixture.responseURL ?? request.url,
+            let response = HTTPURLResponse(
+                url: responseURL,
+                statusCode: fixture.statusCode,
+                httpVersion: nil,
+                headerFields: nil
+            )
+        else {
+            throw FixtureTraeHTTPError.invalidResponse
+        }
+        return (fixture.data, response)
+    }
+
+    func capturedRequestCount() -> Int {
+        requestCount
     }
 }
 

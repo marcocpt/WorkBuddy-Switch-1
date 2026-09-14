@@ -135,6 +135,11 @@ final class AccountStore: ObservableObject {
         try vault.probeExistence(account: userID)
     }
 
+    /// 积分统计等只读用途：返回该账号在钥匙串中保存的原始凭据字节（不改写任何东西）。
+    func credentialData(for userID: String) throws -> Data {
+        try vault.loadData(account: userID)
+    }
+
     /// 导出用：枚举全部索引账号并镜像钥匙串凭据（严格只读；缺失快照返回 blob=nil，不中断）。
     func backupExportItems() -> [(profile: AccountProfile, blob: Data?)] {
         accounts.map { profile in
