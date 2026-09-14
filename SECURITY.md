@@ -19,6 +19,26 @@ refreshed.
 - Access and refresh tokens are never logged, rendered, cached in quota history,
   or committed.
 
+## Account backup and restore
+
+WorkBuddy Switch can export every saved account snapshot to a single backup file
+and restore it on this machine.
+
+- The backup file is an encrypted container (AES-256-GCM) whose key is derived
+  from a user-chosen password with PBKDF2-HMAC-SHA256 and a random salt. The
+  password is never stored and cannot be recovered; losing it makes the backup
+  permanently unreadable.
+- The backup holds opaque copies of the existing Keychain items. Export never
+  produces or re-derives new credentials.
+- Import restores snapshots into the macOS Keychain under the same rules as
+  freshly captured accounts. Accounts already present in the Keychain are
+  skipped and never overwritten.
+- Backup files are written with user-only permissions. WorkBuddy Switch itself
+  does not log, index, cache, or upload backup files. If the user saves a backup
+  into a cloud-synchronized or externally managed directory (iCloud, Dropbox,
+  OneDrive, a network share, and so on), that service may synchronize or index
+  the encrypted file.
+
 ## Trae data preservation
 
 Trae CN and TRAE Work account switching changes only the authentication state

@@ -1,5 +1,7 @@
+import AppKit
 import ServiceManagement
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct SettingsView: View {
     @ObservedObject var state: AppState
@@ -7,6 +9,7 @@ struct SettingsView: View {
     @AppStorage("autoCaptureCurrentAccount") private var autoCapture = false
     @AppStorage("refreshIntervalMinutes") private var refreshInterval = 10
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @State private var backupPasswordPanel: BackupPasswordPanel?
 
     init(state: AppState) {
         self.state = state
@@ -123,6 +126,21 @@ struct SettingsView: View {
                     )
                 }
 
+                settingsSection("账号数据") {
+                    backupActionRow(
+                        title: "导出全部账号",
+                        systemImage: "square.and.arrow.up",
+                        note: "将三端已保存的账号快照加密导出为文件",
+                        action: beginExport
+                    )
+                    backupActionRow(
+                        title: "导入账号",
+                        systemImage: "square.and.arrow.down",
+                        note: "从备份文件恢复账号，已存在的将跳过",
+                        action: beginImport
+                    )
+                }
+
                 HStack {
                     Link(
                         "GitHub",
@@ -147,6 +165,94 @@ struct SettingsView: View {
                 message: Text(alert.message),
                 dismissButton: .default(Text("好"))
             )
+        }
+    }
+
+    @MainActor
+    private func beginExport() {
+        guard state.canStartAccountBackup, backupPasswordPanel == nil else { return }
+        guard state.hasAnySavedAccount else {
+            state.alert = AppAlert(
+                title: "无法导出",
+                message: "当前没有已保存的账号，请先在各客户端登录并保存账号。"
+            )
+            return
+        }
+        // 独立可激活的 NSPanel（activation 门控 + 显式 first responder），
+        // 确保键盘焦点真正转移到密码框；presenter 由本视图强持有。
+        let presenter = BackupPasswordPanel()
+        backupPasswordPanel = presenter
+        presenter.presentExport { [weak presenter] password in
+            if backupPasswordPanel === presenter { backupPasswordPanel = nil }
+            continueExport(password: password)
+        } onCancel: { [weak presenter] in
+            if backupPasswordPanel === presenter { backupPasswordPanel = nil }
+        }
+    }
+
+    @MainActor
+    private func continueExport(password: String) {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.workBuddySwitchBackup]
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        panel.nameFieldStringValue =
+            "WorkBuddy-Switch-账号备份-\(formatter.string(from: Date())).wbsacct"
+        panel.message = "备份文件使用导出密码加密，密码无法找回，请妥善保管。"
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task {
+            await state.exportAllAccounts(to: url, password: password)
+        }
+    }
+
+    @MainActor
+    private func beginImport() {
+        guard state.canStartAccountBackup, backupPasswordPanel == nil else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.workBuddySwitchBackup, .data]
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let presenter = BackupPasswordPanel()
+        backupPasswordPanel = presenter
+        presenter.presentImport { [weak presenter] password in
+            if backupPasswordPanel === presenter { backupPasswordPanel = nil }
+            Task {
+                await self.state.importAccounts(from: url, password: password)
+            }
+        } onCancel: { [weak presenter] in
+            if backupPasswordPanel === presenter { backupPasswordPanel = nil }
+        }
+    }
+
+    private func backupActionRow(
+        title: String,
+        systemImage: String,
+        note: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        HStack(spacing: 12) {
+            Button(action: action) {
+                HStack(spacing: 8) {
+                    if state.isAccountBackupBusy {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                    Label(title, systemImage: systemImage)
+                }
+                .frame(minWidth: 150, alignment: .leading)
+            }
+            .controlSize(.large)
+            .disabled(!state.canStartAccountBackup || state.isAccountBackupBusy || backupPasswordPanel != nil)
+            Spacer()
+            Text(note)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.trailing)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -198,5 +304,12 @@ struct SettingsView: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(title)，\(available ? "可用" : "不可用")，\(detail)")
+    }
+}
+
+extension UTType {
+    /// WorkBuddy Switch 账号备份文件类型（加密容器）。
+    static var workBuddySwitchBackup: UTType {
+        UTType(exportedAs: "com.koi128bit.openusage.wbsacct", conformingTo: .data)
     }
 }

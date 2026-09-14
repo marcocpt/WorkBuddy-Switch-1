@@ -17,11 +17,17 @@ swiftc \
   "$repo_root/Sources/OpenUsage/UsageParser.swift" \
   "$repo_root/Sources/OpenUsage/UsageService.swift" \
   "$repo_root/Sources/OpenUsage/WorkBuddyController.swift" \
+  "$repo_root/Sources/OpenUsage/AccountStore.swift" \
+  "$repo_root/Sources/OpenUsage/KeychainVault.swift" \
   "$repo_root/Sources/OpenUsage/TraeSupport.swift" \
+  "$repo_root/Sources/OpenUsage/AccountBackup.swift" \
+  "$repo_root/Sources/OpenUsage/AccountBackupFile.swift" \
+  "$repo_root/Sources/OpenUsage/AccountBackupService.swift" \
   "$repo_root/Sources/OpenUsage/TraeUsageService.swift" \
   "$repo_root/Tests/SelfTest.swift" \
   -framework AppKit \
   -framework Security \
+  -framework CryptoKit \
   -lsqlite3 \
   -o "$build_dir/OpenUsageSelfTest"
 

@@ -26,6 +26,7 @@ final class AppState: ObservableObject {
     @Published private(set) var resumingSessionID: String?
     @Published var usageAccountID: String?
     @Published var alert: AppAlert?
+    @Published private(set) var isAccountBackupBusy = false
 
     let accounts = AccountStore()
     let traeAccounts = TraeAccountStore()
@@ -33,6 +34,7 @@ final class AppState: ObservableObject {
     private let usageService = UsageService()
     private let traeUsageService = TraeUsageService()
     private let workBuddy = WorkBuddyController()
+    private let accountBackup = AccountBackupService()
     private var startupTask: Task<Void, Never>?
     private var localRefreshTask: Task<Void, Never>?
     private var autoRefreshTask: Task<Void, Never>?
@@ -392,6 +394,10 @@ final class AppState: ObservableObject {
     }
 
     func captureCurrentAccount() {
+        guard !isAccountBackupBusy else {
+            present(OpenUsageError.commandFailed("账号备份或导入正在进行，请稍后再试。"), title: "操作被阻止")
+            return
+        }
         do {
             if let variant = selectedTraeVariant {
                 _ = try traeAccounts.captureCurrent(variant)
@@ -408,6 +414,10 @@ final class AppState: ObservableObject {
     }
 
     func switchAccount(to profile: AccountProfile) async {
+        guard !isAccountBackupBusy else {
+            present(OpenUsageError.commandFailed("账号备份或导入正在进行，请稍后再试。"), title: "操作被阻止")
+            return
+        }
         guard resumingSessionID == nil else {
             alert = AppAlert(
                 title: "正在准备对话",
@@ -430,6 +440,10 @@ final class AppState: ObservableObject {
     }
 
     func renameAccount(_ profile: AccountProfile, nickname: String) {
+        guard !isAccountBackupBusy else {
+            present(OpenUsageError.commandFailed("账号备份或导入正在进行，请稍后再试。"), title: "操作被阻止")
+            return
+        }
         do {
             try accounts.rename(profile, to: nickname)
         } catch {
@@ -438,6 +452,10 @@ final class AppState: ObservableObject {
     }
 
     func removeAccount(_ profile: AccountProfile) {
+        guard !isAccountBackupBusy else {
+            present(OpenUsageError.commandFailed("账号备份或导入正在进行，请稍后再试。"), title: "操作被阻止")
+            return
+        }
         do {
             try accounts.remove(profile)
             if usageAccountID == profile.id {
@@ -450,6 +468,10 @@ final class AppState: ObservableObject {
     }
 
     func switchTraeAccount(to profile: TraeAccountProfile) async {
+        guard !isAccountBackupBusy else {
+            present(OpenUsageError.commandFailed("账号备份或导入正在进行，请稍后再试。"), title: "操作被阻止")
+            return
+        }
         guard resumingSessionID == nil else {
             alert = AppAlert(
                 title: "正在准备对话",
@@ -475,6 +497,10 @@ final class AppState: ObservableObject {
         _ profile: TraeAccountProfile,
         nickname: String
     ) {
+        guard !isAccountBackupBusy else {
+            present(OpenUsageError.commandFailed("账号备份或导入正在进行，请稍后再试。"), title: "操作被阻止")
+            return
+        }
         do {
             try traeAccounts.rename(profile, to: nickname)
         } catch {
@@ -483,6 +509,10 @@ final class AppState: ObservableObject {
     }
 
     func removeTraeAccount(_ profile: TraeAccountProfile) {
+        guard !isAccountBackupBusy else {
+            present(OpenUsageError.commandFailed("账号备份或导入正在进行，请稍后再试。"), title: "操作被阻止")
+            return
+        }
         do {
             try traeAccounts.remove(profile)
             if usageAccountID == profile.userID,
@@ -492,6 +522,116 @@ final class AppState: ObservableObject {
             }
         } catch {
             present(error, title: "移除失败")
+        }
+    }
+
+    // MARK: - 账号备份（导入 / 导出）
+
+    var hasAnySavedAccount: Bool {
+        !accounts.accounts.isEmpty || !traeAccounts.accounts.isEmpty
+    }
+
+    var canStartAccountBackup: Bool {
+        !isAccountBackupBusy
+            && !accounts.isSwitching
+            && traeAccounts.switchingVariant == nil
+            && resumingSessionID == nil
+    }
+
+    /// 导出全部账号到用户选择的 URL（加密文件）。
+    func exportAllAccounts(to url: URL, password: String) async {
+        guard canStartAccountBackup else {
+            present(
+                OpenUsageError.commandFailed("已有账号切换正在进行，请稍后再试。"),
+                title: "操作被阻止"
+            )
+            return
+        }
+        isAccountBackupBusy = true
+        defer { isAccountBackupBusy = false }
+        do {
+            let built = try accountBackup.buildExportPayload(
+                workBuddy: accounts,
+                traeAccounts: traeAccounts
+            )
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            let payloadJSON = try encoder.encode(built.payload)
+            let sealed = try await Task.detached { () -> Data in
+                try AccountBackupFile.encryptedFile(
+                    payloadJSON: payloadJSON,
+                    password: password
+                )
+            }.value
+            try writeSecureBackupFile(sealed, to: url)
+            var message = "已导出 \(built.summary.totalExported) 个账号。\n保存位置：\(url.path)"
+            if built.summary.skippedWithoutSnapshot > 0 {
+                message += "\n跳过 \(built.summary.skippedWithoutSnapshot) 个缺少凭据快照的账号，请重新登录并保存后再导出。"
+            }
+            alert = AppAlert(title: "导出完成", message: message)
+        } catch let error as AccountBackupServiceError {
+            alert = AppAlert(
+                title: "无法导出",
+                message: error.errorDescription ?? "当前没有可导出的账号。"
+            )
+        } catch {
+            present(error, title: "导出失败")
+        }
+    }
+
+    /// 从用户选择的备份文件导入账号。
+    func importAccounts(from url: URL, password: String) async {
+        guard canStartAccountBackup else {
+            present(
+                OpenUsageError.commandFailed("已有账号切换正在进行，请稍后再试。"),
+                title: "操作被阻止"
+            )
+            return
+        }
+        isAccountBackupBusy = true
+        defer { isAccountBackupBusy = false }
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            let byteCount = (attributes[.size] as? NSNumber)?.intValue ?? 0
+            try validateAccountBackupInput(byteCount: byteCount, accountCount: 0)
+            let fileData = try Data(contentsOf: url)
+            guard fileData.count <= AccountBackupInputLimits.maxFileBytes else {
+                throw AccountBackupInputError.fileTooLarge(fileData.count)
+            }
+            let payloadJSON = try await Task.detached { () -> Data in
+                try AccountBackupFile.decryptedPayload(
+                    fileData: fileData,
+                    password: password
+                )
+            }.value
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let envelope = try decoder.decode(BackupEnvelope.self, from: payloadJSON)
+            guard
+                envelope.format == BackupEnvelope.currentFormat,
+                envelope.version == BackupEnvelope.currentVersion
+            else {
+                throw AccountBackupFileError.unsupportedVersion
+            }
+            try validateAccountBackupInput(
+                byteCount: byteCount,
+                accountCount: envelope.accounts.count
+            )
+            let summary = accountBackup.importFromEnvelope(
+                envelope,
+                workBuddy: accounts,
+                traeAccounts: traeAccounts
+            )
+            var message = "成功导入 \(summary.imported) 个账号，跳过 \(summary.skipped) 个已存在账号。"
+            if summary.failed > 0 {
+                message += "\n失败 \(summary.failed) 个：" + summary.failures.map { "\n· \($0)" }.joined()
+            }
+            alert = AppAlert(
+                title: summary.failed > 0 ? "导入完成（部分失败）" : "导入完成",
+                message: message
+            )
+        } catch {
+            present(error, title: "导入失败")
         }
     }
 
@@ -525,6 +665,10 @@ final class AppState: ObservableObject {
     }
 
     func resume(_ session: SessionRecord) async {
+        guard !isAccountBackupBusy else {
+            present(OpenUsageError.commandFailed("账号备份或导入正在进行，请稍后再试。"), title: "操作被阻止")
+            return
+        }
         guard beginResuming(session) else { return }
         defer { finishResuming(session) }
 
@@ -552,6 +696,10 @@ final class AppState: ObservableObject {
     }
 
     func openInTerminal(_ session: SessionRecord) async {
+        guard !isAccountBackupBusy else {
+            present(OpenUsageError.commandFailed("账号备份或导入正在进行，请稍后再试。"), title: "操作被阻止")
+            return
+        }
         guard beginResuming(session) else { return }
         defer { finishResuming(session) }
 
@@ -765,7 +913,12 @@ final class AppState: ObservableObject {
             traeQuota = nil
             locallyAttributedCycleCredits = nil
             if force {
-                present(error, title: "\(provider.title) 用量读取失败")
+                // 登录过期已在服务层自动重试过；仍失败时用内联提示替代
+                // 弹窗，避免切换账号时被模态错误打断。
+                guard case TraeSupportError.authenticationExpired = error else {
+                    present(error, title: "\(provider.title) 用量读取失败")
+                    return
+                }
             }
         }
     }
@@ -850,7 +1003,8 @@ final class AppState: ObservableObject {
         }
         return try await traeUsageService.fetchReport(
             for: variant,
-            range: range
+            range: range,
+            targetUserID: usageAccountID
         )
     }
 
@@ -866,7 +1020,8 @@ final class AppState: ObservableObject {
         }
         return try await traeUsageService.fetchUsage(
             for: variant,
-            range: range
+            range: range,
+            targetUserID: usageAccountID
         )
     }
 
@@ -874,6 +1029,13 @@ final class AppState: ObservableObject {
         variant: TraeVariant
     ) throws -> TraeCredentialSnapshot? {
         guard let accountID = usageAccountID else { return nil }
+        // 当前 storage.json 的凭据由 Trae 应用维护并随登录自动刷新，
+        // 优先使用它，避免拿钥匙串里可能过期的快照 token 触发 401。
+        // 用真实磁盘身份（而非可能陈旧的缓存）判断，防止缓存与磁盘
+        // 不同步时把别的账号数据标到目标账号头上。
+        if traeAccounts.currentStorageUserID(for: variant) == accountID {
+            return nil
+        }
         if traeAccounts.accounts(for: variant).contains(
             where: { $0.userID == accountID }
         ) {
@@ -881,9 +1043,6 @@ final class AppState: ObservableObject {
                 for: variant,
                 userID: accountID
             )
-        }
-        if traeAccounts.currentUserID(for: variant) == accountID {
-            return nil
         }
         throw TraeSupportError.accountSnapshotMissing
     }
@@ -909,6 +1068,46 @@ final class AppState: ObservableObject {
         refreshGeneration &+= 1
         usageGeneration &+= 1
         isRefreshing = false
+    }
+
+    /// 备份文件安全写入：同目录临时文件 0600 创建 → 权限确认 → 原子替换作为最后一步。
+    private func writeSecureBackupFile(_ data: Data, to url: URL) throws {
+        let directory = url.deletingLastPathComponent()
+        let temporary = directory.appendingPathComponent(
+            ".openusage-backup-\(UUID().uuidString).tmp"
+        )
+        do {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            guard FileManager.default.createFile(
+                atPath: temporary.path,
+                contents: data,
+                attributes: [.posixPermissions: 0o600]
+            ) else {
+                throw OpenUsageError.commandFailed("无法写入备份文件，请检查目标位置权限。")
+            }
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: temporary.path
+            )
+            // commit-last：替换/移动作为最后一个可能失败的步骤。
+            if FileManager.default.fileExists(atPath: url.path) {
+                _ = try FileManager.default.replaceItemAt(
+                    url,
+                    withItemAt: temporary,
+                    backupItemName: nil,
+                    options: [.usingNewMetadataOnly]
+                )
+            } else {
+                try FileManager.default.moveItem(at: temporary, to: url)
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: temporary)
+            throw error
+        }
     }
 
     private func localCycleCredits(for quota: QuotaSnapshot) async -> Double? {
