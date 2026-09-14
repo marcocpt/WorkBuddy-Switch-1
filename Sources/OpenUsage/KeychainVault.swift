@@ -139,43 +139,6 @@ struct KeychainVault {
         }
     }
 
-    /// 严格只读批量读取：单次 SecItemCopyMatching 取回 service 下全部凭据，按 account 映射。
-    /// 避免按账号逐项发起 SecItemCopyMatching，从而减少 Keychain 锁定/未授权时的重复授权机会。
-    /// 空字典表示 service 下无条目；Keychain 故障抛错，绝不当作空处理。
-    func loadAllData() throws -> [String: Data] {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecReturnData as String: true,
-            kSecReturnAttributes as String: true,
-            // 用数字 limit：kSecMatchLimitAll 字符串与 kSecReturnData 组合在 macOS 13 返回 errSecParam(-50)。
-            kSecMatchLimit as String: 10_000
-        ]
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        switch status {
-        case errSecSuccess:
-            var map: [String: Data] = [:]
-            if let items = result as? [[String: Any]] {
-                for item in items {
-                    if let account = item[kSecAttrAccount as String] as? String,
-                       let data = item[kSecValueData as String] as? Data {
-                        map[account] = data
-                    }
-                }
-            } else if let single = result as? [String: Any],
-                      let account = single[kSecAttrAccount as String] as? String,
-                      let data = single[kSecValueData as String] as? Data {
-                map[account] = data
-            }
-            return map
-        case errSecItemNotFound:
-            return [:]
-        default:
-            throw OpenUsageError.keychain(message(for: status))
-        }
-    }
-
     /// 仅创建写入：已存在返回 false，绝不覆盖既有项；新插入返回 true。
     func insertIfAbsent(_ data: Data, account: String) throws -> Bool {
         let insert: [String: Any] = [
