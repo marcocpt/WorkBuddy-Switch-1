@@ -626,22 +626,41 @@ enum TraeAPIParser {
                 ?? dictionary(pack["quota"])
                 ?? [:]
             let usage = dictionary(pack["usage"]) ?? [:]
+            // 同时存在 basic/bonus 与 credits_limit 时以 basic/bonus 为准（不重复计数）
+            let hasBasicCreditFields = quota["basic_usage_limit"] != nil
+                || quota["bonus_usage_limit"] != nil
+                || usage["basic_usage_amount"] != nil
+                || usage["bonus_usage_amount"] != nil
             let basicLimit = number(quota["basic_usage_limit"]) ?? 0
             let bonusLimit = number(quota["bonus_usage_limit"]) ?? 0
             let basicUsed = max(number(usage["basic_usage_amount"]) ?? 0, 0)
             let bonusUsed = max(number(usage["bonus_usage_amount"]) ?? 0, 0)
+            // 订阅/权益包形态常用 credits_limit + credits_amount（TraeWorkAssistant 同口径）
+            let creditLimit = hasBasicCreditFields
+                ? nil
+                : number(quota["credits_limit"])
+            let creditAmount = hasBasicCreditFields
+                ? nil
+                : number(usage["credits_amount"])
             hasCreditFields = hasCreditFields
-                || quota["basic_usage_limit"] != nil
-                || quota["bonus_usage_limit"] != nil
-                || usage["basic_usage_amount"] != nil
-                || usage["bonus_usage_amount"] != nil
-            used += basicUsed + bonusUsed
-            payGoUsed += max(number(usage["pay_go_amount"]) ?? 0, 0)
-            if basicLimit < 0 || bonusLimit < 0 {
-                isUnlimited = true
+                || hasBasicCreditFields
+                || creditLimit != nil
+            if let creditLimit {
+                used += max(creditAmount ?? 0, 0)
+                if creditLimit < 0 {
+                    isUnlimited = true
+                } else {
+                    finiteTotal += max(creditLimit, 0)
+                }
             } else {
-                finiteTotal += max(basicLimit, 0) + max(bonusLimit, 0)
+                used += basicUsed + bonusUsed
+                if basicLimit < 0 || bonusLimit < 0 {
+                    isUnlimited = true
+                } else {
+                    finiteTotal += max(basicLimit, 0) + max(bonusLimit, 0)
+                }
             }
+            payGoUsed += max(number(usage["pay_go_amount"]) ?? 0, 0)
             let fastLimit = number(quota["premium_model_fast_request_limit"]) ?? 0
             let fastUsed = max(number(usage["premium_model_fast_amount"]) ?? 0, 0)
             requestUsed += fastUsed

@@ -2341,6 +2341,42 @@ enum OpenUsageSelfTest {
             "Trae quota parser supports legacy request-count plans"
         )
 
+        // T-TR-05：订阅/权益包 credits_limit 口径（与 TraeWorkAssistant 的积分统计同款字段）
+        let creditsLimitQuotaData = Data(
+            """
+            {
+              "data": {
+                "user_entitlement_pack_list": [
+                  {
+                    "entitlement_base_info": {
+                      "user_id": "credits-limit-user",
+                      "product_type": 1,
+                      "quota": { "credits_limit": 1500 }
+                    },
+                    "usage": { "credits_amount": 320, "pay_go_amount": 5 },
+                    "expire_time": 1787500800,
+                    "group_name": "会员积分"
+                  }
+                ]
+              }
+            }
+            """.utf8
+        )
+        let creditsLimitQuota = try TraeAPIParser.parseQuota(
+            creditsLimitQuotaData,
+            fallbackUserID: "fallback-user",
+            capturedAt: capturedAt
+        )
+        try expect(
+            creditsLimitQuota.sourceUserID == "credits-limit-user"
+                && creditsLimitQuota.unit == .credits
+                && creditsLimitQuota.total == 1500
+                && creditsLimitQuota.used == 320
+                && creditsLimitQuota.payGoUsed == 5
+                && !creditsLimitQuota.isUnlimited,
+            "Trae quota parser reads credits_limit/credits_amount packs as credit quotas"
+        )
+
         // MARK: - 导入 / 导出账号备份：载荷核心（Phase 1）
 
         let backupDate = Date(timeIntervalSince1970: 1_750_000_000)
