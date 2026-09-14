@@ -33,6 +33,9 @@ struct CreditPackage: Hashable, Sendable {
     let expiringSoon: Bool
 
     var isUnlimited: Bool { total == nil }
+
+    /// 是否应列在积分包列表中：不限量包或仍有剩余；有限且已用尽的包不列出
+    var isListable: Bool { isUnlimited || remaining > 0 }
 }
 
 /// 单个已保存账号的积分统计视图模型（不含任何凭据字段）。

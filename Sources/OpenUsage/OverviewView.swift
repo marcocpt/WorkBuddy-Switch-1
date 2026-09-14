@@ -649,8 +649,8 @@ private struct CreditStatCard: View {
                 } else if !altExpiryText.isEmpty {
                     altExpiryRow
                 }
-                // ④ 完整积分包入口：点击打开积分包详情面板
-                if !stat.packages.isEmpty {
+                // ④ 完整积分包入口：有可列出的包时才显示
+                if !listedPackages.isEmpty {
                     packageDetailButton
                 }
             }
@@ -722,7 +722,7 @@ private struct CreditStatCard: View {
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                 }
-                let pkgCount = stat.packages.count
+                let pkgCount = listedPackages.count
                 if pkgCount > 0 {
                     if stat.unit != .unlimited {
                         Text("   ")
@@ -833,7 +833,7 @@ private struct CreditStatCard: View {
             HStack(spacing: 4) {
                 Text("查看全部积分包")
                     .font(.system(size: 11, weight: .medium))
-                Text("（\(stat.packages.count)）")
+                Text("（\(listedPackages.count)）")
                     .font(.system(size: 11))
                     .foregroundStyle(.tertiary)
                 Spacer(minLength: 0)
@@ -850,7 +850,7 @@ private struct CreditStatCard: View {
         .popover(isPresented: $showPackagesDetail, arrowEdge: .top) {
             PackageListDetailView(
                 accountName: stat.accountName.isEmpty ? accountShortID : stat.accountName,
-                packages: CreditPackageOrdering.sorted(stat.packages)
+                packages: CreditPackageOrdering.sorted(listedPackages)
             )
         }
     }
@@ -860,6 +860,11 @@ private struct CreditStatCard: View {
     /// 即将到期包列表：与「查看全部积分包」同一套顺序的前段（剩余>0、未过期、有到期日）
     private var upcomingExpiryPackages: [CreditPackage] {
         CreditPackageOrdering.upcoming(stat.packages)
+    }
+
+    /// 可列出的积分包：排除「有限且已用尽」的包；不限量包（remaining 天然为 0）仍列出
+    private var listedPackages: [CreditPackage] {
+        stat.packages.filter(\.isListable)
     }
 
     private var accountShortID: String {
@@ -980,10 +985,12 @@ private struct CreditPackageRow: View {
         var parts: [String] = []
         if pkg.expired {
             parts.append("已到期")
-        } else if pkg.expiringSoon {
-            parts.append("7 天内到期")
         } else if let date = pkg.expireAt {
+            // 先显示具体到期时间；7 天内到期作为附加提示
             parts.append("到期 \(CreditStatCard.shortDateFormatter.string(from: date))")
+            if pkg.expiringSoon {
+                parts.append("7 天内到期")
+            }
         } else {
             parts.append("暂无到期")
         }

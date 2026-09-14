@@ -3918,6 +3918,28 @@ enum OpenUsageSelfTest {
                 .map(\.name) == ["near", "far"],
             "the near-expiry preview is the front slice of the same ordering"
         )
+        // 列表过滤：有限且已用尽 → 不列出；仍有剩余 → 列出；不限量（remaining 天然为 0）→ 仍列出
+        let unlimitedListable = CreditPackage(
+            name: "unlimited",
+            total: nil,
+            remaining: 0,
+            used: 0,
+            expireAt: nil,
+            expired: false,
+            expiringSoon: false
+        )
+        try expect(
+            pkgUsedUp.isListable == false
+                && pkgNear.isListable == true
+                && unlimitedListable.isListable == true,
+            "list filtering keeps unlimited packs but drops finite used-up packs"
+        )
+        try expect(
+            [pkgFar, pkgNoDate, pkgUsedUp, pkgNear, pkgExpired, unlimitedListable]
+                .filter(\.isListable)
+                .map(\.name) == ["far", "no-date", "near", "expired", "unlimited"],
+            "the full package list excludes only finite used-up packs"
+        )
 
         // MARK: - 概览页积分统计：服务层隔离（Phase 2）
 
