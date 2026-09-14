@@ -561,66 +561,32 @@ struct OverviewView: View {
     }
 }
 
-/// 概览页积分统计卡片：单个已保存账号的积分余量与到期信息。
+/// 概览页积分统计卡片：参考 changexbc/workbuddy-switch 设计。
 private struct CreditStatCard: View {
     let stat: AccountCreditStat
+    /// 即将到期预览区最多展示几条；完整列表走展开入口
+    private let nearExpiryPreviewLimit = 3
+    /// 控制「查看全部积分包」展开/收起状态
+    @State private var packagesExpanded = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 6) {
-                Image(systemName: providerSystemImage)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(tint)
-                Text(stat.accountName.isEmpty ? accountShortID : stat.accountName)
-                    .font(.system(size: 12, weight: .semibold))
-                    .lineLimit(1)
-                if stat.isCurrent {
-                    Text("当前")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(OpenUsageColors.lime)
-                }
-                Spacer(minLength: 0)
-            }
-            Text(accountShortID)
-                .font(.system(size: 10))
-                .foregroundStyle(.tertiary)
-                .lineLimit(1)
+        VStack(alignment: .leading, spacing: 10) {
+            // ① 顶栏：provider 图标 + 账号名 + 当前标记 + 短ID
+            headerRow
+            // ② 主值 + 副标题（单位 · 包数 · 更新时间）
             if let error = stat.error {
-                Text("—")
-                    .font(.system(size: 25, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.secondary)
-                Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(.system(size: 11))
-                    .foregroundStyle(OpenUsageColors.coral)
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
+                errorBlock(error)
             } else {
-                Text(mainValue)
-                    .font(.system(size: 25, weight: .semibold, design: .rounded))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.75)
-                if stat.unit != .unlimited {
-                    Text(unitCaption)
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
+                mainValueBlock
+                // ③ 即将到期 TOP N 明细列表（始终展开）
+                if !upcomingExpiryPackages.isEmpty {
+                    upcomingExpirySection
+                } else if !altExpiryText.isEmpty {
+                    altExpiryRow
                 }
-                Text(expiryLine)
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                // ④ 展开入口：只要有包就始终提供完整列表入口
                 if !stat.packages.isEmpty {
-                    DisclosureGroup {
-                        VStack(alignment: .leading, spacing: 10) {
-                            ForEach(stat.packages.indices, id: \.self) { index in
-                                CreditPackageRow(pkg: stat.packages[index])
-                            }
-                        }
-                        .padding(.top, 6)
-                    } label: {
-                        Text("全部积分包（\(stat.packages.count)）")
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(.secondary)
-                    }
+                    packageDisclosure
                 }
             }
         }
@@ -634,6 +600,187 @@ private struct CreditStatCard: View {
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
+    // MARK: - ① 顶栏
+
+    private var headerRow: some View {
+        HStack(spacing: 6) {
+            Image(systemName: providerSystemImage)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(tint)
+            Text(stat.accountName.isEmpty ? accountShortID : stat.accountName)
+                .font(.system(size: 12, weight: .semibold))
+                .lineLimit(1)
+            if stat.isCurrent {
+                Text("当前")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(OpenUsageColors.lime)
+            }
+            Spacer(minLength: 0)
+            Text(accountShortID)
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+        }
+    }
+
+    // MARK: - ② 主值 + 副标题
+
+    @ViewBuilder
+    private var mainValueBlock: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(mainValue)
+                .font(.system(size: 25, weight: .semibold, design: .rounded))
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+            HStack(spacing: 0) {
+                if stat.unit != .unlimited {
+                    Text(unitCaption)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                let pkgCount = stat.packages.count
+                if pkgCount > 0 {
+                    if stat.unit != .unlimited {
+                        Text("   ")
+                            .font(.system(size: 11))
+                    }
+                    Text("\(pkgCount) 个积分包")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+                if let refresh = stat.refreshDate {
+                    Text("\(Self.timeFormatter.string(from: refresh)) 更新")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+        }
+    }
+
+    private func errorBlock(_ error: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("—")
+                .font(.system(size: 25, weight: .semibold, design: .rounded))
+                .foregroundStyle(.secondary)
+            Label(error, systemImage: "exclamationmark.triangle.fill")
+                .font(.system(size: 11))
+                .foregroundStyle(OpenUsageColors.coral)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    // MARK: - ③ 即将到期区
+
+    private var upcomingExpirySection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("即将到期")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(Array(upcomingExpiryPackages.prefix(nearExpiryPreviewLimit).enumerated()), id: \.offset) { _, pkg in
+                    upcomingExpiryRow(pkg)
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .fill(Color.primary.opacity(0.04))
+            )
+        }
+    }
+
+    private func upcomingExpiryRow(_ pkg: CreditPackage) -> some View {
+        HStack(spacing: 8) {
+            Text(Self.amountText(pkg.remaining))
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(
+                    pkg.expiringSoon ? OpenUsageColors.coral : .primary
+                )
+                .monospacedDigit()
+            Text(unitLabel)
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+            Text(pkg.name)
+                .font(.system(size: 11))
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer(minLength: 4)
+            if let date = pkg.expireAt {
+                Text("\(Self.shortDateFormatter.string(from: date))到期")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(
+                        pkg.expiringSoon ? OpenUsageColors.coral : .secondary
+                    )
+            }
+        }
+    }
+
+    /// 没有即将到期包时的替代提示行
+    private var altExpiryText: String {
+        guard let date = stat.soonestExpireAt else {
+            return stat.provider == .workBuddy ? "暂无可展示的到期" : "暂无结算日期"
+        }
+        let day = Self.shortDateFormatter.string(from: date)
+        let prefix = stat.provider == .workBuddy ? "最近到期" : "下次结算"
+        return "\(prefix) \(day)"
+    }
+
+    @ViewBuilder
+    private var altExpiryRow: some View {
+        HStack {
+            Text(altExpiryText)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+            Spacer()
+        }
+    }
+
+    // MARK: - ④ 展开入口
+
+    private var packageDisclosure: some View {
+        DisclosureGroup(isExpanded: $packagesExpanded) {
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(stat.packages.indices, id: \.self) { index in
+                    CreditPackageRow(pkg: stat.packages[index])
+                }
+            }
+            .padding(.top, 6)
+        } label: {
+            HStack(spacing: 4) {
+                Text("查看全部积分包")
+                    .font(.system(size: 11, weight: .medium))
+                Text("（\(stat.packages.count)）")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+                    .rotationEffect(.degrees(packagesExpanded ? 90 : 0))
+                    .animation(.easeInOut(duration: 0.15), value: packagesExpanded)
+            }
+            .foregroundStyle(.secondary)
+        }
+        .tint(.clear)
+    }
+
+    // MARK: - 计算属性
+
+    /// 按「到期日升序」排序的即将到期包列表：剩余>0 且 未过期 且 有到期日
+    private var upcomingExpiryPackages: [CreditPackage] {
+        stat.packages
+            .filter { $0.remaining > 0 && !$0.expired }
+            .compactMap { pkg -> (CreditPackage, Date)? in
+                guard let expireAt = pkg.expireAt else { return nil }
+                return (pkg, expireAt)
+            }
+            .sorted { $0.1 < $1.1 }
+            .map(\.0)
+    }
+
     private var accountShortID: String {
         let id = stat.accountID
         guard id.count > 12 else { return id }
@@ -644,6 +791,14 @@ private struct CreditStatCard: View {
         switch stat.unit {
         case .credits: return "总积分"
         case .requests: return "总请求"
+        case .unlimited: return ""
+        }
+    }
+
+    private var unitLabel: String {
+        switch stat.unit {
+        case .credits: return "积分"
+        case .requests: return "请求"
         case .unlimited: return ""
         }
     }
@@ -674,37 +829,21 @@ private struct CreditStatCard: View {
         }
     }
 
-    private var expiryLine: String {
-        // 始终展示近期到期：取「仍有剩余且带到期日」中最近的一个积分包
-        if let pkg = nearExpiryPackage, let date = pkg.expireAt {
-            let day = Self.shortDateFormatter.string(from: date)
-            let amount = Self.amountText(pkg.remaining)
-            let unit = stat.unit == .requests ? "请求" : "积分"
-            return "近期到期 \(amount) \(unit) · \(day)"
-        }
-        guard let date = stat.soonestExpireAt else {
-            return stat.provider == .workBuddy ? "暂无可展示的到期" : "暂无结算日期"
-        }
-        let day = Self.shortDateFormatter.string(from: date)
-        let prefix = stat.provider == .workBuddy ? "最近到期" : "下次结算"
-        return "\(prefix) \(day)"
-    }
-
-    private var nearExpiryPackage: CreditPackage? {
-        stat.packages
-            .filter { $0.remaining > 0 && !$0.expired && $0.expireAt != nil }
-            .min { $0.expireAt! < $1.expireAt! }
-    }
-
-    private static func amountText(_ value: Double) -> String {
+    static func amountText(_ value: Double) -> String {
         value.rounded() == value
             ? String(Int(value))
             : DisplayFormat.credits(value)
     }
 
-    private static let shortDateFormatter: DateFormatter = {
+    static let shortDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "M/d"
+        return formatter
+    }()
+
+    static let timeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm"
         return formatter
     }()
 }

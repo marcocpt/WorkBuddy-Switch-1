@@ -52,6 +52,8 @@ struct AccountCreditStat: Identifiable, Hashable, Sendable {
     let sourceUserID: String
     /// 全部积分包明细（WorkBuddy 资源包 / Trae 权益包）；未取到为空
     var packages: [CreditPackage] = []
+    /// 本轮刷新时间（整个 refresh 批次的开始时间，所有账号共用）；失败时为 nil
+    let refreshDate: Date?
 
     var id: String { "\(provider.rawValue):\(accountID)" }
 
@@ -59,7 +61,8 @@ struct AccountCreditStat: Identifiable, Hashable, Sendable {
         accountID: String,
         accountName: String,
         isCurrent: Bool,
-        sourceUserID: String
+        sourceUserID: String,
+        refreshDate: Date? = nil
     ) -> AccountCreditStat {
         AccountCreditStat(
             provider: .workBuddy,
@@ -71,7 +74,8 @@ struct AccountCreditStat: Identifiable, Hashable, Sendable {
             expiringSoonRemaining: 0,
             soonestExpireAt: nil,
             error: nil,
-            sourceUserID: sourceUserID
+            sourceUserID: sourceUserID,
+            refreshDate: refreshDate
         )
     }
 
@@ -93,7 +97,8 @@ struct AccountCreditStat: Identifiable, Hashable, Sendable {
             expiringSoonRemaining: 0,
             soonestExpireAt: nil,
             error: error,
-            sourceUserID: sourceUserID
+            sourceUserID: sourceUserID,
+            refreshDate: nil
         )
     }
 
@@ -102,7 +107,8 @@ struct AccountCreditStat: Identifiable, Hashable, Sendable {
         expiringSoonRemaining: Double,
         soonestExpireAt: Date?,
         unit: CreditUsageUnit,
-        packages: [CreditPackage] = []
+        packages: [CreditPackage] = [],
+        refreshDate: Date? = nil
     ) -> AccountCreditStat {
         AccountCreditStat(
             provider: provider,
@@ -115,7 +121,8 @@ struct AccountCreditStat: Identifiable, Hashable, Sendable {
             soonestExpireAt: soonestExpireAt,
             error: nil,
             sourceUserID: sourceUserID,
-            packages: packages
+            packages: packages,
+            refreshDate: refreshDate
         )
     }
 }

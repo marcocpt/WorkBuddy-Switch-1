@@ -130,7 +130,8 @@ actor CreditStatsService {
                 expiringSoonRemaining: summary.expiringSoonRemaining,
                 soonestExpireAt: summary.soonestExpireAt,
                 unit: .credits,
-                packages: packages
+                packages: packages,
+                refreshDate: now
             )
         } catch let error as WorkBuddyCreditError {
             return workBuddyFailure(account, message: error.message)
@@ -227,7 +228,8 @@ actor CreditStatsService {
             expiringSoonRemaining: 0,
             soonestExpireAt: nil,
             error: nil,
-            sourceUserID: sourceUserID
+            sourceUserID: sourceUserID,
+            refreshDate: nil
         )
     }
 
@@ -311,7 +313,8 @@ enum CreditStatMapper {
             soonestExpireAt: soonest,
             error: nil,
             sourceUserID: sourceUserID,
-            packages: packages
+            packages: packages,
+            refreshDate: now
         )
     }
 
