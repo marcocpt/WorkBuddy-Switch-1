@@ -27,12 +27,15 @@ final class AppState: ObservableObject {
     @Published var usageAccountID: String?
     @Published var alert: AppAlert?
     @Published private(set) var isAccountBackupBusy = false
+    @Published private(set) var creditStats: [AccountCreditStat] = []
+    @Published private(set) var isCreditStatsLoading = false
 
     let accounts = AccountStore()
     let traeAccounts = TraeAccountStore()
     private let sessionStore = SessionStore()
     private let usageService = UsageService()
     private let traeUsageService = TraeUsageService()
+    private let creditStatsService = CreditStatsService()
     private let workBuddy = WorkBuddyController()
     private let accountBackup = AccountBackupService()
     private var startupTask: Task<Void, Never>?
@@ -41,6 +44,7 @@ final class AppState: ObservableObject {
     private var refreshGeneration: UInt64 = 0
     private var sessionGeneration: UInt64 = 0
     private var usageGeneration: UInt64 = 0
+    private var creditStatsGeneration: UInt64 = 0
 
     init() {
         let today = Calendar.current.startOfDay(for: Date())
@@ -132,6 +136,89 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// 积分概览卡片图标点击：把某账号设为激活账号。
+    /// 与 `selectProvider + switchAccount` 交叉调用不同，这里先对齐 provider，
+    /// 再切账号，全程只触发一次 `refreshAll`，避免双刷新竞态与 usageAccountID 错绑。
+    /// 原子顺序：先解析并完成底层切换，成功后才提交 selectedProvider / usageAccountID
+    /// / UI 状态，失败时保持原页面状态不变。
+    func switchOverviewAccount( // swiftlint:disable:this function_body_length
+        provider: ManagedProvider,
+        sourceUserID: String,
+        isCurrent: Bool
+    ) async {
+        guard !isCurrent else { return }
+        guard !isAccountBackupBusy else {
+            present(
+                OpenUsageError.commandFailed("账号备份或导入正在进行，请稍后再试。"),
+                title: "操作被阻止"
+            )
+            return
+        }
+        guard resumingSessionID == nil else {
+            alert = AppAlert(
+                title: "正在准备对话",
+                message: "对话迁移或恢复完成后再切换账号。"
+            )
+            return
+        }
+        // 已有账号切换在进行时静默忽略重复点击，避免二次 invalidate / 失败弹窗
+        if isActiveAccountSwitching {
+            return
+        }
+        // 1) 底层切换：失败前不修改任何全局状态，失败即返回保持原状
+        var targetAccountID: String?
+        do {
+            switch provider {
+            case .workBuddy:
+                guard
+                    let profile = accounts.accounts.first(where: { $0.id == sourceUserID })
+                else {
+                    return
+                }
+                try await accounts.switchAccount(to: profile)
+                targetAccountID = profile.id
+            case .traeCN, .traeWork:
+                guard
+                    let variant = provider.traeVariant,
+                    let profile = traeAccounts
+                        .accounts(for: variant)
+                        .first(where: { $0.userID == sourceUserID })
+                else {
+                    return
+                }
+                try await traeAccounts.switchAccount(to: profile)
+                targetAccountID = profile.userID
+            }
+        } catch {
+            present(error, title: "切换失败")
+            return
+        }
+        guard let targetAccountID else { return }
+        // 2) 切换成功后才提交全局状态，只触发一次刷新
+        invalidateRefreshResults()
+        if provider != selectedProvider {
+            selectedProvider = provider
+            UserDefaults.standard.set(
+                provider.rawValue,
+                forKey: "selectedManagedProvider"
+            )
+            sessions = []
+            usage = .empty
+            traeQuota = nil
+            sessionMessage = provider.supportsSessions
+                ? nil
+                : "\(provider.title) 暂不支持对话浏览或恢复。"
+            usageMessage = nil
+            quotaMessage = "正在读取 \(provider.title) 用量。"
+        }
+        usageAccountID = targetAccountID
+        quota = nil
+        locallyAttributedCycleCredits = nil
+        quotaMessage = "正在刷新新账号用量。"
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        await refreshAll(force: true)
+    }
+
     func start() async {
         if let startupTask {
             await startupTask.value
@@ -186,8 +273,13 @@ final class AppState: ObservableObject {
     }
 
     func refreshAll(force: Bool = false) async {
+        // 积分统计与用量/额度并行刷新，不阻塞概览主流程
+        let creditTask = Task { @MainActor [weak self] in
+            await self?.refreshCreditStats()
+        }
         if let variant = selectedTraeVariant {
             await refreshTraeAll(variant: variant, force: force)
+            _ = await creditTask.value
             return
         }
 
@@ -280,6 +372,162 @@ final class AppState: ObservableObject {
             locallyAttributedCycleCredits = nil
             quotaMessage = error.localizedDescription
         }
+
+        // 统一完成语义：与 Trae 分支一致，await 本次并发启动的积分刷新
+        _ = await creditTask.value
+    }
+
+    /// 全量刷新已保存账号的积分统计（三端，逐账号一张卡）。
+    /// 单账号失败由服务层转成错误卡片；凭据缺失直接置错误卡；代际校验丢弃过期结果。
+    /// 凭据读取走「每服务一次」的批量钥匙串调用，避免按账号数量重复弹出钥匙串授权。
+    private func refreshCreditStats() async {
+        creditStatsGeneration &+= 1
+        let generation = creditStatsGeneration
+        isCreditStatsLoading = true
+        defer {
+            if creditStatsGeneration == generation {
+                isCreditStatsLoading = false
+            }
+        }
+
+        var workBuddyInputs: [WorkBuddyCreditAccount] = []
+        var directFailures: [AccountCreditStat] = []
+        var workBuddyBlobs: [String: Data]
+        var workBuddyReadSucceeded: Bool
+        do {
+            workBuddyBlobs = try accounts.allCredentialData()
+            workBuddyReadSucceeded = true
+        } catch {
+            workBuddyReadSucceeded = false
+            workBuddyBlobs = [:]
+            // 批量读取失败（如钥匙串锁定/未授权）：该 provider 全部账号一张失败卡，不再继续组装或请求
+            for profile in accounts.accounts {
+                directFailures.append(
+                    .failure(
+                        provider: .workBuddy,
+                        accountID: profile.id,
+                        accountName: profile.nickname,
+                        isCurrent: profile.id == accounts.currentUserID,
+                        sourceUserID: profile.id,
+                        error: "凭据读取失败，请解锁钥匙串后刷新重试"
+                    )
+                )
+            }
+        }
+        if workBuddyReadSucceeded {
+            for profile in accounts.accounts {
+                let isCurrent = profile.id == accounts.currentUserID
+                if isCurrent {
+                    guard let document = try? AuthDocument.loadActive() else {
+                        directFailures.append(
+                            .failure(
+                                provider: .workBuddy,
+                                accountID: profile.id,
+                                accountName: profile.nickname,
+                                isCurrent: true,
+                                sourceUserID: profile.id,
+                                error: "无法读取当前 WorkBuddy 登录信息"
+                            )
+                        )
+                        continue
+                    }
+                    workBuddyInputs.append(
+                        WorkBuddyCreditAccount(
+                            userID: profile.id,
+                            accountID: profile.id,
+                            accountName: profile.nickname,
+                            isCurrent: true,
+                            authData: document.rawData
+                        )
+                    )
+                } else if let stored = workBuddyBlobs[profile.id] {
+                    workBuddyInputs.append(
+                        WorkBuddyCreditAccount(
+                            userID: profile.id,
+                            accountID: profile.id,
+                            accountName: profile.nickname,
+                            isCurrent: false,
+                            authData: stored
+                        )
+                    )
+                } else {
+                    directFailures.append(
+                        .failure(
+                            provider: .workBuddy,
+                            accountID: profile.id,
+                            accountName: profile.nickname,
+                            isCurrent: false,
+                            sourceUserID: profile.id,
+                            error: "凭据不可用，请重新登录并保存"
+                        )
+                    )
+                }
+            }
+        }
+
+        var traeInputs: [TraeCreditAccount] = []
+        var traeSnapshots: [String: TraeCredentialSnapshot]
+        var traeReadSucceeded: Bool
+        do {
+            traeSnapshots = try traeAccounts.allSnapshots()
+            traeReadSucceeded = true
+        } catch {
+            traeReadSucceeded = false
+            traeSnapshots = [:]
+            for variant in TraeVariant.allCases {
+                let currentUserID = traeAccounts.currentUserID(for: variant)
+                for profile in traeAccounts.accounts(for: variant) {
+                    directFailures.append(
+                        .failure(
+                            provider: variant.provider,
+                            accountID: profile.id,
+                            accountName: profile.nickname,
+                            isCurrent: profile.userID == currentUserID,
+                            sourceUserID: profile.userID,
+                            error: "凭据读取失败，请解锁钥匙串后刷新重试"
+                        )
+                    )
+                }
+            }
+        }
+        if traeReadSucceeded {
+            for variant in TraeVariant.allCases {
+                let currentUserID = traeAccounts.currentUserID(for: variant)
+                for profile in traeAccounts.accounts(for: variant) {
+                    let isCurrent = profile.userID == currentUserID
+                    guard let snapshot = traeSnapshots[profile.id] else {
+                        directFailures.append(
+                            .failure(
+                                provider: variant.provider,
+                                accountID: profile.id,
+                                accountName: profile.nickname,
+                                isCurrent: isCurrent,
+                                sourceUserID: profile.userID,
+                                error: "凭据快照不可用，请重新登录并保存"
+                            )
+                        )
+                        continue
+                    }
+                    traeInputs.append(
+                        TraeCreditAccount(
+                            variant: variant,
+                            profileID: profile.id,
+                            userID: profile.userID,
+                            accountName: profile.nickname,
+                            isCurrent: isCurrent,
+                            snapshot: snapshot
+                        )
+                    )
+                }
+            }
+        }
+
+        let fetched = await creditStatsService.refresh(
+            workBuddy: workBuddyInputs,
+            trae: traeInputs
+        )
+        guard creditStatsGeneration == generation else { return }
+        creditStats = CreditStatMapper.sort(fetched + directFailures)
     }
 
     func recalculateUsage() async {
@@ -1067,7 +1315,9 @@ final class AppState: ObservableObject {
     private func invalidateRefreshResults() {
         refreshGeneration &+= 1
         usageGeneration &+= 1
+        creditStatsGeneration &+= 1
         isRefreshing = false
+        isCreditStatsLoading = false
     }
 
     /// 备份文件安全写入：同目录临时文件 0600 创建 → 权限确认 → 原子替换作为最后一步。

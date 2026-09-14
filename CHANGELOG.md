@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- Stop repeated Keychain authorization prompts after every rebuild: local and
+  development builds now prefer a stable self-signed code-signing identity
+  (`scripts/setup-local-codesign.sh`), so the app's designated requirement no
+  longer changes with each compile. Run `zsh scripts/setup-local-codesign.sh`
+  once, then `scripts/build-release.sh` signs with the stable identity
+  automatically (ad-hoc signing remains the fallback).
+- Add a credit statistics panel at the top of the Overview page: every saved
+  account (WorkBuddy, Trae CN, and TRAE Work) gets its own card showing total
+  remaining credits (or requests) and the expiring-soon amount with its date.
+  WorkBuddy accounts read resource-level expiry from the billing API; Trae
+  accounts use their quota API with the next billing date. One account failing
+  (including an expired login) degrades only its own card to an inline message
+  and never blocks the rest of the overview.
+
+- Order the credit statistics panel by expiry and lay it out as one column per
+  client (WorkBuddy, Trae CN, TRAE Work): cards inside a column lead with the
+  soonest expiry, dateless cards follow, and failed cards sink to the bottom.
+  A card's "near expiry" preview and its full package list now share one
+  expiry-ascending order (live packages first, then expired or used-up ones,
+  then dateless ones). Trae cards are ordered by their earliest live package
+  expiry instead of the next billing date, so the on-screen order matches the
+  dates shown inside each card.
 - Fix Trae CN usage reads after switching to an account whose login has
   expired: the app now prefers the live storage credentials maintained by the
   running Trae app, waits and retries automatically on 401/403 instead of

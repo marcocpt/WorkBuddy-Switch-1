@@ -1,0 +1,25 @@
+{
+  "feature": "overview-credit-stats",
+  "created_at": "2026-09-14",
+  "approval_basis": "auto-approved per user auto-execution preference (2026-09-08); intake scope confirmed via AskUserQuestion 2026-09-14 (all-accounts)",
+  "source_digests": {
+    "REQ": "785564446b4e394b8d2b0ae53cdac2cabe14fd4bccdc0a850718b95ebddeb1db",
+    "DSG": "ea041d5c8d393befe62d3c6018d72dbc82029bfd2b0bb745e6006d17a185ef0b",
+    "VIS": "0c618fafe6f1cc9f7424e660be31816dbc56a440d863632825819eafbd1a7f41",
+    "TST": "fbcbe0d73b023d5d521f836bc905dcf950e6293483ccd229d53cfd5214e1fc21"
+  },
+  "normative_anchors": {
+    "REQ": {
+      "FR": ["FR-1", "FR-2", "FR-3", "FR-4", "FR-5", "FR-6", "FR-7", "FR-8", "FR-9", "FR-10", "FR-11", "FR-12", "FR-13"],
+      "AC": ["AC-1", "AC-2", "AC-3", "AC-4", "AC-5", "AC-6", "AC-7", "AC-8", "AC-9", "AC-10"],
+      "NFR": ["NFR-1", "NFR-2", "NFR-3", "NFR-4", "NFR-5", "NFR-6"],
+      "SECTIONS": ["§9 失败路径与边界", "§11 决策自由度"]
+    },
+    "DSG": {
+      "SECTIONS": ["§1 分工", "§1.1 解析层", "§1.2 服务层", "§1.3 编排层", "§1.4 仓库补充", "§1.5 界面层", "§2 数据流", "§3 状态", "§4 账号身份与排序", "§5 安全边界", "§6 FR 映射", "§7 NFR 落实", "§8 风险与对策", "§9 交付物清单", "§10 修订记录"]
+    },
+    "TST": {
+      "CASES": ["T-PR-01", "T-PR-02", "T-PR-03", "T-PR-04", "T-PR-05", "T-PR-06", "T-PR-07", "T-PR-08", "T-TR-01", "T-TR-02", "T-TR-03", "T-TR-04", "T-TR-05", "T-SR-01", "T-ISO-01", "T-ISO-01b", "T-ISO-01c", "T-ISO-01d", "T-ISO-01e", "T-RACE-01", "T-PKG-01", "T-PKG-02", "INT-01", "INT-02", "UI-01", "UI-02", "UI-03", "UI-04", "UI-05"]
+    }
+  }
+}

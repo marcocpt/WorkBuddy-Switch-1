@@ -23,6 +23,10 @@ struct OverviewView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
+                if state.hasAnySavedAccount,
+                   state.isCreditStatsLoading || !state.creditStats.isEmpty {
+                    creditStatsPanel
+                }
                 hero
                 metrics
                 HStack(alignment: .top, spacing: 22) {
@@ -53,6 +57,126 @@ struct OverviewView: View {
                 .accessibilityLabel("刷新")
             }
         }
+    }
+
+    // MARK: - 积分统计
+
+    private var creditStatsPanel: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 8) {
+                Text("积分统计")
+                    .font(.system(size: 16, weight: .semibold))
+                if state.isCreditStatsLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+                Spacer()
+            }
+            .padding(.bottom, 10)
+            if state.isCreditStatsLoading && state.creditStats.isEmpty {
+                creditSkeletonColumns
+            } else {
+                creditColumns
+            }
+        }
+        .padding(.top, 18)
+    }
+
+    /// 每个 app 一列（WorkBuddy / Trae CN / TRAE Work），列内卡片按最近到期日升序。
+    private var creditColumns: some View {
+        HStack(alignment: .top, spacing: 12) {
+            ForEach(CreditStatMapper.columns(state.creditStats)) { column in
+                VStack(alignment: .leading, spacing: 10) {
+                    creditColumnHeader(column.provider, count: column.stats.count)
+                    ForEach(column.stats) { stat in
+                        CreditStatCard(
+                            stat: stat,
+                            onSwitchAccount: { switchAccount(stat) },
+                            onRefresh: {
+                                Task { await state.refreshAll(force: true) }
+                            }
+                        )
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+            }
+        }
+    }
+
+    /// 首次加载尚未拿到数据时，按「有已保存账号的 app」铺骨架列。
+    private var creditSkeletonColumns: some View {
+        HStack(alignment: .top, spacing: 12) {
+            ForEach(providersWithSavedAccounts, id: \.self) { provider in
+                VStack(alignment: .leading, spacing: 10) {
+                    creditColumnHeader(provider, count: nil)
+                    creditSkeletonCard
+                }
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+            }
+        }
+    }
+
+    private func creditColumnHeader(_ provider: ManagedProvider, count: Int?) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: provider.systemImage)
+                .font(.system(size: 11, weight: .semibold))
+            Text(provider.title)
+                .font(.system(size: 12, weight: .semibold))
+            if let count {
+                Text("\(count)")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+            }
+            Spacer(minLength: 0)
+        }
+        .foregroundStyle(.secondary)
+    }
+
+    /// 拥有已保存账号的 app（首次加载铺骨架时用），顺序与列顺序一致。
+    private var providersWithSavedAccounts: [ManagedProvider] {
+        var result: [ManagedProvider] = []
+        if !accounts.accounts.isEmpty {
+            result.append(.workBuddy)
+        }
+        for variant in TraeVariant.allCases where !traeAccounts.accounts(for: variant).isEmpty {
+            result.append(variant.provider)
+        }
+        return result
+    }
+
+    /// 点击积分卡图标：把该卡片账号切换为当前激活账号（当前账号禁用）。
+    /// 由 AppState.switchOverviewAccount 原子执行：先对齐 provider，再切账号，
+    /// 只触发一次刷新，避免跨 provider 错绑 usageAccountID。
+    private func switchAccount(_ stat: AccountCreditStat) {
+        Task {
+            await state.switchOverviewAccount(
+                provider: stat.provider,
+                sourceUserID: stat.sourceUserID,
+                isCurrent: stat.isCurrent
+            )
+        }
+    }
+
+    private var creditSkeletonCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            RoundedRectangle(cornerRadius: 4)
+                .fill(Color.primary.opacity(0.08))
+                .frame(width: 96, height: 12)
+            ProgressView()
+                .controlSize(.small)
+                .frame(width: 80, height: 24, alignment: .leading)
+            RoundedRectangle(cornerRadius: 4)
+                .fill(Color.primary.opacity(0.06))
+                .frame(height: 10)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(OpenUsageColors.separator, lineWidth: 1)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     private var hero: some View {
@@ -495,5 +619,433 @@ struct OverviewView: View {
                 }
             }
         }
+    }
+}
+
+/// 概览页积分统计卡片：参考 changexbc/workbuddy-switch 设计。
+private struct CreditStatCard: View {
+    let stat: AccountCreditStat
+    /// 点击卡片图标切换账号（仅非当前账号可点）
+    let onSwitchAccount: () -> Void
+    /// 点击卡片刷新按钮强制刷新积分
+    let onRefresh: () -> Void
+    /// 即将到期预览区最多展示几条；完整列表走积分包详情
+    private let nearExpiryPreviewLimit = 3
+    /// 控制「积分包详情」面板
+    @State private var showPackagesDetail = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            // ① 顶栏：provider 图标（切换按钮）+ 账号名 + 当前标记 + 短ID + 刷新
+            headerRow
+            // ② 主值 + 副标题（单位 · 包数 · 更新时间）
+            if let error = stat.error {
+                errorBlock(error)
+            } else {
+                mainValueBlock
+                // ③ 即将到期 TOP N 明细列表（快到期在前，始终展开）
+                if !upcomingExpiryPackages.isEmpty {
+                    upcomingExpirySection
+                } else if !altExpiryText.isEmpty {
+                    altExpiryRow
+                }
+                // ④ 完整积分包入口：点击打开积分包详情面板
+                if !stat.packages.isEmpty {
+                    packageDetailButton
+                }
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(OpenUsageColors.separator, lineWidth: 1)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    // MARK: - ① 顶栏（放大 1.5 倍）
+
+    private var headerRow: some View {
+        HStack(spacing: 8) {
+            Button(action: onSwitchAccount) {
+                Image(systemName: providerSystemImage)
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(tint)
+                    .frame(width: 22, height: 22, alignment: .center)
+            }
+            .buttonStyle(.plain)
+            .disabled(stat.isCurrent)
+            .help(stat.isCurrent ? "当前账号" : "切换到该账号")
+            .accessibilityLabel(stat.isCurrent ? "当前账号" : "切换到该账号")
+            Text(stat.accountName.isEmpty ? accountShortID : stat.accountName)
+                .font(.system(size: 18, weight: .semibold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+                .layoutPriority(1)
+            if stat.isCurrent {
+                Text("当前")
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(OpenUsageColors.lime)
+            }
+            Spacer(minLength: 0)
+            Button(action: onRefresh) {
+                Image(systemName: "arrow.clockwise")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 22, height: 22, alignment: .center)
+            }
+            .buttonStyle(.plain)
+            .help("刷新全部数据和积分")
+            .accessibilityLabel("刷新全部数据和积分")
+            Text(accountShortID)
+                .font(.system(size: 11))
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+                .layoutPriority(0)
+        }
+    }
+
+    // MARK: - ② 主值 + 副标题
+
+    @ViewBuilder
+    private var mainValueBlock: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(mainValue)
+                .font(.system(size: 25, weight: .semibold, design: .rounded))
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+            HStack(spacing: 0) {
+                if stat.unit != .unlimited {
+                    Text(unitCaption)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                let pkgCount = stat.packages.count
+                if pkgCount > 0 {
+                    if stat.unit != .unlimited {
+                        Text("   ")
+                            .font(.system(size: 11))
+                    }
+                    Text("\(pkgCount) 个积分包")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+                if let refresh = stat.refreshDate {
+                    Text("\(Self.timeFormatter.string(from: refresh)) 更新")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+        }
+    }
+
+    private func errorBlock(_ error: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("—")
+                .font(.system(size: 25, weight: .semibold, design: .rounded))
+                .foregroundStyle(.secondary)
+            Label(error, systemImage: "exclamationmark.triangle.fill")
+                .font(.system(size: 11))
+                .foregroundStyle(OpenUsageColors.coral)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    // MARK: - ③ 即将到期区
+
+    private var upcomingExpirySection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("即将到期")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 4) {
+                let previews = upcomingExpiryPackages.prefix(nearExpiryPreviewLimit)
+                ForEach(Array(previews.enumerated()), id: \.offset) { _, pkg in
+                    upcomingExpiryRow(pkg)
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .fill(Color.primary.opacity(0.04))
+            )
+        }
+    }
+
+    private func upcomingExpiryRow(_ pkg: CreditPackage) -> some View {
+        HStack(spacing: 8) {
+            Text(Self.amountText(pkg.remaining))
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(
+                    pkg.expiringSoon ? OpenUsageColors.coral : .primary
+                )
+                .monospacedDigit()
+            Text(unitLabel)
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+            Text(pkg.name)
+                .font(.system(size: 11))
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer(minLength: 4)
+            if let date = pkg.expireAt {
+                Text("\(Self.shortDateFormatter.string(from: date))到期")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(
+                        pkg.expiringSoon ? OpenUsageColors.coral : .secondary
+                    )
+            }
+        }
+    }
+
+    /// 没有即将到期包时的替代提示行
+    private var altExpiryText: String {
+        guard let date = stat.soonestExpireAt else {
+            return stat.provider == .workBuddy ? "暂无可展示的到期" : "暂无结算日期"
+        }
+        let day = Self.shortDateFormatter.string(from: date)
+        let prefix = stat.provider == .workBuddy ? "最近到期" : "下次结算"
+        return "\(prefix) \(day)"
+    }
+
+    @ViewBuilder
+    private var altExpiryRow: some View {
+        HStack {
+            Text(altExpiryText)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+            Spacer()
+        }
+    }
+
+    // MARK: - ④ 积分包详情入口
+
+    /// 最后一行：点击打开「积分包列表详情」悬浮窗（popover 锚定本按钮行）。
+    private var packageDetailButton: some View {
+        Button {
+            showPackagesDetail = true
+        } label: {
+            HStack(spacing: 4) {
+                Text("查看全部积分包")
+                    .font(.system(size: 11, weight: .medium))
+                Text("（\(stat.packages.count)）")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+            }
+            .padding(.vertical, 2)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .help("打开积分包列表详情")
+        .accessibilityLabel("打开积分包列表详情")
+        .popover(isPresented: $showPackagesDetail, arrowEdge: .top) {
+            PackageListDetailView(
+                accountName: stat.accountName.isEmpty ? accountShortID : stat.accountName,
+                packages: CreditPackageOrdering.sorted(stat.packages)
+            )
+        }
+    }
+
+    // MARK: - 计算属性
+
+    /// 即将到期包列表：与「查看全部积分包」同一套顺序的前段（剩余>0、未过期、有到期日）
+    private var upcomingExpiryPackages: [CreditPackage] {
+        CreditPackageOrdering.upcoming(stat.packages)
+    }
+
+    private var accountShortID: String {
+        let id = stat.accountID
+        guard id.count > 12 else { return id }
+        return "\(id.prefix(7))...\(id.suffix(4))"
+    }
+
+    private var unitCaption: String {
+        switch stat.unit {
+        case .credits: return "总积分"
+        case .requests: return "总请求"
+        case .unlimited: return ""
+        }
+    }
+
+    private var unitLabel: String {
+        switch stat.unit {
+        case .credits: return "积分"
+        case .requests: return "请求"
+        case .unlimited: return ""
+        }
+    }
+
+    private var providerSystemImage: String {
+        stat.provider.systemImage
+    }
+
+    private var tint: Color {
+        switch stat.provider {
+        case .workBuddy: return OpenUsageColors.blue
+        case .traeCN: return OpenUsageColors.coral
+        case .traeWork: return OpenUsageColors.cyan
+        }
+    }
+
+    private var mainValue: String {
+        switch stat.unit {
+        case .credits:
+            return stat.totalRemaining.map(DisplayFormat.credits) ?? "—"
+        case .requests:
+            guard let value = stat.totalRemaining else { return "—" }
+            return value.rounded() == value
+                ? String(Int(value))
+                : DisplayFormat.credits(value)
+        case .unlimited:
+            return "不限量"
+        }
+    }
+
+    static func amountText(_ value: Double) -> String {
+        value.rounded() == value
+            ? String(Int(value))
+            : DisplayFormat.credits(value)
+    }
+
+    static let shortDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "M/d"
+        return formatter
+    }()
+
+    static let timeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm"
+        return formatter
+    }()
+}
+
+/// 单个积分/权益包明细行（名称 + 剩余/总量 + 进度条 + 到期/已用）。
+private struct CreditPackageRow: View {
+    let pkg: CreditPackage
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Text(pkg.name)
+                    .font(.system(size: 11, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 4)
+                if pkg.isUnlimited {
+                    Text("不限量")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("\(CreditStatCard.amountText(pkg.remaining)) / \(CreditStatCard.amountText(pkg.total ?? 0))")
+                        .font(.system(size: 11, weight: .semibold))
+                        .monospacedDigit()
+                }
+            }
+            GeometryReader { proxy in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.primary.opacity(0.08))
+                    Capsule()
+                        .fill(
+                            pkg.expired
+                                ? OpenUsageColors.coral
+                                : (pkg.expiringSoon ? OpenUsageColors.coral : OpenUsageColors.blue)
+                        )
+                        .frame(width: proxy.size.width * ratio)
+                }
+            }
+            .frame(height: 4)
+            Text(detailLine)
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+    }
+
+    private var ratio: Double {
+        guard let total = pkg.total, total > 0 else { return pkg.isUnlimited ? 1 : 0 }
+        return min(max(pkg.remaining / total, 0), 1)
+    }
+
+    private var detailLine: String {
+        var parts: [String] = []
+        if pkg.expired {
+            parts.append("已到期")
+        } else if pkg.expiringSoon {
+            parts.append("7 天内到期")
+        } else if let date = pkg.expireAt {
+            parts.append("到期 \(CreditStatCard.shortDateFormatter.string(from: date))")
+        } else {
+            parts.append("暂无到期")
+        }
+        parts.append("已用 \(CreditStatCard.amountText(pkg.used))")
+        return parts.joined(separator: " · ")
+    }
+}
+
+/// 积分包列表详情悬浮窗（popover）：点击卡片「查看全部积分包」打开，展示完整包明细。
+private struct PackageListDetailView: View {
+    let accountName: String
+    let packages: [CreditPackage]
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Text("积分包列表")
+                    .font(.system(size: 15, weight: .semibold))
+                Text(accountName)
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer()
+                Button {
+                    dismiss()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 18, weight: .medium))
+                        .foregroundStyle(.tertiary)
+                        .frame(width: 24, height: 24, alignment: .center)
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut(.cancelAction)
+                .help("关闭")
+                .accessibilityLabel("关闭")
+            }
+            .padding(.bottom, 2)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    ForEach(packages.indices, id: \.self) { index in
+                        VStack(alignment: .leading, spacing: 0) {
+                            CreditPackageRow(pkg: packages[index])
+                            if index < packages.count - 1 {
+                                Divider()
+                                    .padding(.top, 10)
+                            }
+                        }
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+            }
+            .background(Color(nsColor: .controlBackgroundColor))
+            .overlay {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(OpenUsageColors.separator, lineWidth: 1)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
+        .padding(16)
+        .frame(width: 420, height: 480)
     }
 }

@@ -135,11 +135,28 @@ final class AccountStore: ObservableObject {
         try vault.probeExistence(account: userID)
     }
 
+    /// 积分统计等只读用途：返回该账号在钥匙串中保存的原始凭据字节（不改写任何东西）。
+    func credentialData(for userID: String) throws -> Data {
+        try vault.loadData(account: userID)
+    }
+
+    /// 只读批量读取：单次钥匙串调用取回全部账号凭据，减少 Keychain 未授权时的重复授权机会。
+    func allCredentialData() throws -> [String: Data] {
+        try vault.loadAllData()
+    }
+
     /// 导出用：枚举全部索引账号并镜像钥匙串凭据（严格只读；缺失快照返回 blob=nil，不中断）。
+    /// 批量单次读取全部凭据，Keychain 锁定/需授权时只触发一次解锁提示（逐账号读取会按账号数量重复弹窗）。
     func backupExportItems() -> [(profile: AccountProfile, blob: Data?)] {
-        accounts.map { profile in
-            (profile, try? vault.loadData(account: profile.id))
+        let blobs = (try? vault.loadAllData()) ?? [:]
+        return accounts.map { profile in
+            (profile, blobs[profile.id])
         }
+    }
+
+    /// 单次批量读取现有凭据 account 集合（存在性判定用，一次 Keychain 访问）。
+    func existingAccountIDs() throws -> Set<String> {
+        try Set(vault.loadAllData().keys)
     }
 
     /// 导入用：仅创建写入 + 补偿事务。凭据身份校验通过后，若钥匙串已存在则跳过；

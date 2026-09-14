@@ -2341,6 +2341,49 @@ enum OpenUsageSelfTest {
             "Trae quota parser supports legacy request-count plans"
         )
 
+        // T-TR-05：订阅/权益包 credits_limit 口径（与 TraeWorkAssistant 的积分统计同款字段）
+        let creditsLimitQuotaData = Data(
+            """
+            {
+              "data": {
+                "user_entitlement_pack_list": [
+                  {
+                    "entitlement_base_info": {
+                      "user_id": "credits-limit-user",
+                      "product_type": 1,
+                      "quota": { "credits_limit": 1500 }
+                    },
+                    "usage": { "credits_amount": 320, "pay_go_amount": 5 },
+                    "expire_time": 1787500800,
+                    "group_name": "会员积分"
+                  }
+                ]
+              }
+            }
+            """.utf8
+        )
+        let creditsLimitQuota = try TraeAPIParser.parseQuota(
+            creditsLimitQuotaData,
+            fallbackUserID: "fallback-user",
+            capturedAt: capturedAt
+        )
+        try expect(
+            creditsLimitQuota.sourceUserID == "credits-limit-user"
+                && creditsLimitQuota.unit == .credits
+                && creditsLimitQuota.total == 1500
+                && creditsLimitQuota.used == 320
+                && creditsLimitQuota.payGoUsed == 5
+                && !creditsLimitQuota.isUnlimited,
+            "Trae quota parser reads credits_limit/credits_amount packs as credit quotas"
+        )
+        try expect(
+            creditsLimitQuota.packs.count == 1
+                && creditsLimitQuota.packs[0].name == "会员积分"
+                && creditsLimitQuota.packs[0].limit == 1500
+                && creditsLimitQuota.packs[0].used == 320,
+            "Trae quota parser exposes per-pack credit details for the package list"
+        )
+
         // MARK: - 导入 / 导出账号备份：载荷核心（Phase 1）
 
         let backupDate = Date(timeIntervalSince1970: 1_750_000_000)
@@ -2815,6 +2858,82 @@ enum OpenUsageSelfTest {
             "export leaves the source vault and index untouched"
         )
 
+        // T-ST-04：导出走单次批量读取（loadAll 一次，不再逐账号 load）——根因：Keychain 锁定/需授权时
+        // 逐账号 SecItemCopyMatching 会按账号数量重复弹解锁提示。
+        let loadAllCallsBefore = backupSourceVault.loadAllCalls
+        let loadCallsBefore = backupSourceVault.loadCalls
+        _ = backupSourceStore.backupExportItems()
+        try expect(
+            backupSourceVault.loadAllCalls == loadAllCallsBefore + 1
+                && backupSourceVault.loadCalls == loadCallsBefore,
+            "export enumerates snapshots via a single bulk loadAll (no per-account loads)"
+        )
+
+        // T-KC-01：KeychainVault 批量读取（独立测试 service，单次访问取回全部并正确映射）
+        let bulkService = "com.koi128bit.openusage.selftest.bulk.\(UUID().uuidString)"
+        let bulkVault = KeychainVault(service: bulkService)
+        let bulkAccounts = ["bulk-a", "bulk-b", "bulk-c"]
+        for (index, account) in bulkAccounts.enumerated() {
+            try bulkVault.save(Data("bulk-blob-\(index)".utf8), account: account)
+        }
+        defer {
+            for account in bulkAccounts {
+                try? bulkVault.delete(account: account)
+            }
+        }
+        let bulkMap = try bulkVault.loadAllData()
+        try expect(
+            bulkMap.count == 3
+                && bulkMap["bulk-a"] == Data("bulk-blob-0".utf8)
+                && bulkMap["bulk-b"] == Data("bulk-blob-1".utf8)
+                && bulkMap["bulk-c"] == Data("bulk-blob-2".utf8),
+            "keychain bulk read returns all accounts in one call"
+        )
+        let emptyBulkVault = KeychainVault(
+            service: "com.koi128bit.openusage.selftest.empty.\(UUID().uuidString)"
+        )
+        let emptyBulkMap = try emptyBulkVault.loadAllData()
+        try expect(
+            emptyBulkMap.isEmpty,
+            "keychain bulk read on an empty service returns an empty map"
+        )
+
+        // T-KC-02：批量存在性判定失败时 fail-closed（逐条 failed，绝不进入写入路径）
+        let bulkFailure: Result<Set<String>, Error> = .failure(
+            OpenUsageError.keychain("locked")
+        )
+        let bulkFailureStatus = AccountBackupService.vaultStatusForBulkPresence(
+            wbExisting: bulkFailure,
+            traeExisting: bulkFailure
+        )
+        var bulkFailureApplyCalls = 0
+        let bulkFailureSummary = AccountBackupCore.importSummary(
+            records: [
+                BackupAccountRecord(
+                    provider: .workBuddy,
+                    metadata: backupMetadata("user-123"),
+                    credential: .workBuddy(authData)
+                ),
+                BackupAccountRecord(
+                    provider: .traeCN,
+                    metadata: backupMetadata("t-user-1"),
+                    credential: .trae(chinaSnapshot)
+                )
+            ],
+            vaultStatus: bulkFailureStatus,
+            applyRecord: { _ in
+                bulkFailureApplyCalls += 1
+                return .inserted
+            }
+        )
+        try expect(
+            bulkFailureSummary.failed == 2
+                && bulkFailureSummary.imported == 0
+                && bulkFailureSummary.skipped == 0
+                && bulkFailureApplyCalls == 0,
+            "bulk presence failure fails all records without any writes (fail-closed)"
+        )
+
         let backupTargetVault = FixtureTraeVault()
         let backupTargetStore = TraeAccountStore(
             indexURL: backupTraeIndexURL.appendingPathExtension("target"),
@@ -3087,6 +3206,1139 @@ enum OpenUsageSelfTest {
             )
         }
 
+        // MARK: - 概览页积分统计：解析层（Phase 1）
+
+        let creditNow = Date(timeIntervalSince1970: 1_750_000_000)
+
+        // T-PR-01：precise 优先、fallback 回退、缺失时由 remaining+used 推导
+        let preciseResource = WorkBuddyCreditParser.resource(
+            from: [
+                "CycleCapacityRemainPrecise": "599.0400001",
+                "CycleCapacityRemain": 599,
+                "CycleCapacityUsedPrecise": "25.25"
+            ],
+            now: creditNow
+        )
+        try expect(
+            abs(preciseResource.remaining - 599.0400001) < 0.000_000_01
+                && abs(preciseResource.used - 25.25) < 0.000_000_01
+                && abs(preciseResource.total - 624.2900001) < 0.000_000_01,
+            "credit parser prefers precise values and derives the total"
+        )
+        let zeroPreciseResource = WorkBuddyCreditParser.resource(
+            from: [
+                "CycleCapacityRemainPrecise": "0",
+                "CycleCapacityRemain": 599
+            ],
+            now: creditNow
+        )
+        try expect(
+            zeroPreciseResource.remaining == 0,
+            "credit parser keeps an explicit zero over a legacy fallback value"
+        )
+        let fallbackResource = WorkBuddyCreditParser.resource(
+            from: [
+                "CycleCapacitySize": 2800,
+                "CycleCapacityRemain": 1300,
+                "CycleCapacityUsed": 1500
+            ],
+            now: creditNow
+        )
+        try expect(
+            fallbackResource.total == 2800
+                && fallbackResource.remaining == 1300
+                && fallbackResource.used == 1500,
+            "credit parser falls back to legacy capacity fields"
+        )
+
+        // T-PR-02：到期时间多格式解析（字符串由 creditNow 派生态，验证格式容错）
+        let isoFormat = ISO8601DateFormatter()
+        let localDateTimeFormatter = DateFormatter()
+        localDateTimeFormatter.locale = Locale(identifier: "en_US_POSIX")
+        localDateTimeFormatter.timeZone = .current
+        localDateTimeFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let msTimestamp = WorkBuddyCreditParser.timestamp(
+            NSNumber(value: creditNow.timeIntervalSince1970 * 1_000)
+        )
+        let secondTimestamp = WorkBuddyCreditParser.timestamp(
+            NSNumber(value: creditNow.timeIntervalSince1970)
+        )
+        let isoTimestamp = WorkBuddyCreditParser.timestamp(
+            isoFormat.string(from: creditNow)
+        )
+        let dateTimeTimestamp = WorkBuddyCreditParser.timestamp(
+            localDateTimeFormatter.string(from: creditNow)
+        )
+        try expect(
+            msTimestamp == creditNow
+                && secondTimestamp == creditNow
+                && isoTimestamp == creditNow
+                && dateTimeTimestamp == creditNow,
+            "credit expiry parses milliseconds, seconds, ISO8601, and date-time strings"
+        )
+        let dateOnlyFormatter = DateFormatter()
+        dateOnlyFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dateOnlyFormatter.timeZone = .current
+        dateOnlyFormatter.dateFormat = "yyyy-MM-dd"
+        let nextDay = Calendar.current.date(
+            byAdding: .day,
+            value: 1,
+            to: creditNow
+        )!
+        let dateOnly = WorkBuddyCreditParser.timestamp(
+            dateOnlyFormatter.string(from: nextDay)
+        )
+        guard let dateOnly else {
+            throw SelfTestFailure(
+                message: "date-only credit expiry must parse",
+                file: #filePath,
+                line: #line
+            )
+        }
+        try expect(
+            Calendar.current.isDate(dateOnly, inSameDayAs: nextDay)
+                && Calendar.current.component(.hour, from: dateOnly) == 23
+                && Calendar.current.component(.minute, from: dateOnly) == 59,
+            "date-only credit expiry resolves to the end of the day"
+        )
+
+        // T-PR-03 / T-PR-04：expiringSoon 与 expired 边界
+        let nearExpiry = WorkBuddyCreditParser.resource(
+            from: [
+                "CycleCapacityRemainPrecise": "80",
+                "DeductionEndTime": String(
+                    Int(creditNow.timeIntervalSince1970) + 6 * 24 * 3600
+                )
+            ],
+            now: creditNow
+        )
+        try expect(
+            nearExpiry.expiringSoon && !nearExpiry.expired,
+            "credit within 7 days and remaining is expiring soon"
+        )
+        let boundaryExpiry = WorkBuddyCreditParser.resource(
+            from: [
+                "CycleCapacityRemainPrecise": "10",
+                "CycleEndTime": String(
+                    Int(creditNow.timeIntervalSince1970) + 7 * 24 * 3600
+                )
+            ],
+            now: creditNow
+        )
+        try expect(
+            boundaryExpiry.expiringSoon,
+            "credit exactly 7 days out still counts as expiring soon"
+        )
+        let farExpiry = WorkBuddyCreditParser.resource(
+            from: [
+                "CycleCapacityRemainPrecise": "50",
+                "DeductionEndTime": String(
+                    Int(creditNow.timeIntervalSince1970) + 8 * 24 * 3600
+                )
+            ],
+            now: creditNow
+        )
+        try expect(
+            !farExpiry.expiringSoon && !farExpiry.expired,
+            "credit beyond 7 days is neither expiring soon nor expired"
+        )
+        let alreadyExpired = WorkBuddyCreditParser.resource(
+            from: [
+                "CycleCapacityRemainPrecise": "30",
+                "DeductionEndTime": String(
+                    Int(creditNow.timeIntervalSince1970) - 60
+                )
+            ],
+            now: creditNow
+        )
+        try expect(
+            alreadyExpired.expired && !alreadyExpired.expiringSoon,
+            "credit with remaining after its expiry is marked expired"
+        )
+
+        // T-PR-05：汇总求和与近期到期过滤
+        let summary = WorkBuddyCreditParser.summarize(
+            [nearExpiry, farExpiry, alreadyExpired],
+            now: creditNow
+        )
+        try expect(
+            abs(summary.totalRemaining - 160) < 0.000_001
+                && abs(summary.expiringSoonRemaining - 80) < 0.000_001
+                && summary.soonestExpireAt == alreadyExpired.expireAt,
+            "credit summary sums totals and filters expiring-soon resources"
+        )
+
+        // T-PR-06：响应路径容错（两种嵌套形状一致）
+        let nestedAccountsJSON = Data(
+            """
+            {
+              "code": 0,
+              "data": {
+                "Response": {
+                  "Data": {
+                    "Accounts": [
+                      { "PackageName": "基础包", "CycleCapacityRemainPrecise": "100" }
+                    ]
+                  }
+                }
+              }
+            }
+            """.utf8
+        )
+        let topLevelAccountsJSON = Data(
+            """
+            {
+              "code": 0,
+              "data": {
+                "Accounts": [
+                  { "PackageName": "基础包", "CycleCapacityRemainPrecise": "100" }
+                ]
+              }
+            }
+            """.utf8
+        )
+        func creditResources(_ data: Data) throws -> [CreditResource] {
+            let object = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+            return WorkBuddyCreditParser.accounts(in: object).map {
+                WorkBuddyCreditParser.resource(from: $0, now: creditNow)
+            }
+        }
+        let nestedAccounts = try creditResources(nestedAccountsJSON)
+        let topLevelAccounts = try creditResources(topLevelAccountsJSON)
+        try expect(
+            nestedAccounts.count == 1
+                && topLevelAccounts.count == 1
+                && nestedAccounts[0] == topLevelAccounts[0]
+                && nestedAccounts[0].packageName == "基础包"
+                && nestedAccounts[0].remaining == 100,
+            "credit parser tolerates legacy nested and top-level account shapes"
+        )
+
+        // T-PR-07：空 Accounts 为合法成功（空资源列表，非错误）
+        let emptyAccountsJSON = Data(
+            """
+            { "code": 0, "data": { "Accounts": [] } }
+            """.utf8
+        )
+        let emptyObject = try JSONSerialization.jsonObject(
+            with: emptyAccountsJSON
+        ) as! [String: Any]
+        try expect(
+            WorkBuddyCreditParser.hasAccounts(in: emptyObject)
+                && WorkBuddyCreditParser.accounts(in: emptyObject).isEmpty,
+            "credit parser treats an empty Accounts array as a valid success"
+        )
+        let emptySummary = WorkBuddyCreditParser.summarize([], now: creditNow)
+        try expect(
+            emptySummary.totalRemaining == 0
+                && emptySummary.expiringSoonRemaining == 0
+                && emptySummary.soonestExpireAt == nil,
+            "empty credit resources summarize to zero"
+        )
+
+        // T-PR-08：缺少可用字段的记录应判定为「格式无法识别」，不得伪装成合法的 0 成功
+        let unrecognizedRecord: [String: Any] = ["PackageName": "no-fields"]
+        let brokenResource = WorkBuddyCreditParser.resource(
+            from: unrecognizedRecord,
+            now: creditNow
+        )
+        try expect(
+            !WorkBuddyCreditParser.hasParsableCapacityFields(unrecognizedRecord)
+                && brokenResource.total == 0
+                && brokenResource.remaining == 0
+                && brokenResource.expireAt == nil
+                && !brokenResource.expired
+                && !brokenResource.expiringSoon,
+            "a record without any capacity field is flagged as unrecognized"
+        )
+        let zeroCapacityRecord: [String: Any] = [
+            "CycleCapacityRemainPrecise": "0",
+            "CycleCapacitySizePrecise": "0"
+        ]
+        try expect(
+            WorkBuddyCreditParser.hasParsableCapacityFields(zeroCapacityRecord),
+            "an explicit zero capacity still parses as a recognized field"
+        )
+        let unparsableCapacityRecord: [String: Any] = [
+            "CycleCapacityRemainPrecise": "abc"
+        ]
+        try expect(
+            !WorkBuddyCreditParser.hasParsableCapacityFields(unparsableCapacityRecord),
+            "a capacity key whose value cannot parse does not count as recognized"
+        )
+
+        // T-TR-01：Trae Credits 单位映射
+        let traeCreditsQuota = TraeQuotaSummary(
+            sourceUserID: "shared-fixture-user",
+            used: 20,
+            total: 120,
+            payGoUsed: 0,
+            unit: .credits,
+            packageName: "Pro",
+            cycleStartsAt: creditNow,
+            resetsAt: creditNow.addingTimeInterval(3 * 24 * 3600),
+            capturedAt: creditNow
+        )
+        let traeCreditsStat = CreditStatMapper.statForTraeQuota(
+            variant: .china,
+            accountID: "china:shared-fixture-user",
+            accountName: "CN Account",
+            isCurrent: true,
+            sourceUserID: "shared-fixture-user",
+            quota: traeCreditsQuota,
+            now: creditNow
+        )
+        try expect(
+            traeCreditsStat.provider == .traeCN
+                && traeCreditsStat.unit == .credits
+                && traeCreditsStat.totalRemaining == 100
+                && traeCreditsStat.soonestExpireAt == traeCreditsQuota.resetsAt,
+            "Trae credit quota maps to a credits card with remaining total"
+        )
+
+        // T-TR-02：Trae 不限量
+        let traeUnlimitedQuota = TraeQuotaSummary(
+            sourceUserID: "unlimited-user",
+            used: 45,
+            total: nil,
+            payGoUsed: 2.5,
+            unit: .credits,
+            packageName: "Ultra",
+            cycleStartsAt: creditNow,
+            resetsAt: creditNow.addingTimeInterval(10 * 24 * 3600),
+            capturedAt: creditNow
+        )
+        let traeUnlimitedStat = CreditStatMapper.statForTraeQuota(
+            variant: .work,
+            accountID: "work:unlimited-user",
+            accountName: "Ultra",
+            isCurrent: false,
+            sourceUserID: "unlimited-user",
+            quota: traeUnlimitedQuota,
+            now: creditNow
+        )
+        try expect(
+            traeUnlimitedStat.provider == .traeWork
+                && traeUnlimitedStat.unit == .unlimited
+                && traeUnlimitedStat.totalRemaining == nil
+                && traeUnlimitedStat.expiringSoonRemaining == 0,
+            "unlimited Trae quota maps to an unlimited card without a finite total"
+        )
+
+        // T-TR-03：Trae 请求计费单位
+        let traeRequestQuota = TraeQuotaSummary(
+            sourceUserID: "request-user",
+            used: 3,
+            total: 10,
+            payGoUsed: 0,
+            unit: .requests,
+            packageName: "Pro",
+            cycleStartsAt: nil,
+            resetsAt: creditNow.addingTimeInterval(20 * 24 * 3600),
+            capturedAt: creditNow
+        )
+        let traeRequestStat = CreditStatMapper.statForTraeQuota(
+            variant: .china,
+            accountID: "china:request-user",
+            accountName: "Req",
+            isCurrent: false,
+            sourceUserID: "request-user",
+            quota: traeRequestQuota,
+            now: creditNow
+        )
+        try expect(
+            traeRequestStat.unit == .requests
+                && traeRequestStat.totalRemaining == 7,
+            "request-count Trae quota maps to a requests card"
+        )
+
+        // T-TR-04：resetsAt 在 7 天内 → 近期到期；超出 → 0
+        let nearResetQuota = TraeQuotaSummary(
+            sourceUserID: "near-reset-user",
+            used: 30,
+            total: 50,
+            payGoUsed: 0,
+            unit: .credits,
+            packageName: "Pro",
+            cycleStartsAt: creditNow,
+            resetsAt: creditNow.addingTimeInterval(5 * 24 * 3600),
+            capturedAt: creditNow
+        )
+        let nearResetStat = CreditStatMapper.statForTraeQuota(
+            variant: .china,
+            accountID: "china:near-reset-user",
+            accountName: "Near",
+            isCurrent: false,
+            sourceUserID: "near-reset-user",
+            quota: nearResetQuota,
+            now: creditNow
+        )
+        let farResetStat = CreditStatMapper.statForTraeQuota(
+            variant: .china,
+            accountID: "china:near-reset-user",
+            accountName: "Near",
+            isCurrent: false,
+            sourceUserID: "near-reset-user",
+            quota: TraeQuotaSummary(
+                sourceUserID: "near-reset-user",
+                used: 30,
+                total: 50,
+                payGoUsed: 0,
+                unit: .credits,
+                packageName: "Pro",
+                cycleStartsAt: creditNow,
+                resetsAt: creditNow.addingTimeInterval(9 * 24 * 3600),
+                capturedAt: creditNow
+            ),
+            now: creditNow
+        )
+        try expect(
+            nearResetStat.expiringSoonRemaining == 20
+                && farResetStat.expiringSoonRemaining == 0,
+            "Trae expiring-soon credits follow the 7-day horizon"
+        )
+
+        // T-PKG-01：WorkBuddy 资源包 → 展示明细（名称回退 / 数值 / 到期状态）
+        let pkgResources = [
+            nearExpiry,
+            WorkBuddyCreditParser.resource(
+                from: [
+                    "CycleCapacityRemainPrecise": "50",
+                    "DeductionEndTime": String(
+                        Int(creditNow.timeIntervalSince1970) + 20 * 24 * 3600
+                    )
+                ],
+                now: creditNow
+            )
+        ]
+        let pkgList = WorkBuddyCreditParser.packages(from: pkgResources)
+        try expect(
+            pkgList.count == 2
+                && pkgList[0].remaining == 80
+                && pkgList[0].expiringSoon
+                && pkgList[1].remaining == 50
+                && !pkgList[1].expiringSoon,
+            "WorkBuddy resource packages map to view packages with expiry flags"
+        )
+
+        // T-PKG-02：Trae 多权益包 → 卡片携带全部积分包（剩余与展示名）
+        let multiPackQuotaData = Data(
+            """
+            {
+              "data": {
+                "user_entitlement_pack_list": [
+                  {
+                    "entitlement_base_info": {
+                      "user_id": "multi-pack-user",
+                      "product_type": 1,
+                      "quota": { "credits_limit": 400 }
+                    },
+                    "usage": { "credits_amount": 100 },
+                    "expire_time": 1787500800123,
+                    "display_desc": "会员积分"
+                  },
+                  {
+                    "entitlement_base_info": {
+                      "user_id": "multi-pack-user",
+                      "product_type": 3,
+                      "quota": { "credits_limit": 100 }
+                    },
+                    "usage": { "credits_amount": 90 },
+                    "expire_time": 1787500800,
+                    "display_desc": "兑换积分"
+                  },
+                  {
+                    "entitlement_base_info": {
+                      "user_id": "multi-pack-user",
+                      "product_type": 3,
+                      "quota": { "credits_limit": -1 }
+                    },
+                    "usage": { "credits_amount": 40 },
+                    "expire_time": 1787500800,
+                    "display_desc": "不限量包"
+                  }
+                ]
+              }
+            }
+            """.utf8
+        )
+        let multiPackQuota = try TraeAPIParser.parseQuota(
+            multiPackQuotaData,
+            fallbackUserID: "fallback-user",
+            capturedAt: capturedAt
+        )
+        let multiPackStat = CreditStatMapper.statForTraeQuota(
+            variant: .china,
+            accountID: "china:multi-pack-user",
+            accountName: "Multi",
+            isCurrent: false,
+            sourceUserID: "multi-pack-user",
+            quota: multiPackQuota,
+            now: creditNow
+        )
+        try expect(
+            multiPackStat.packages.count == 3
+                && multiPackStat.packages[0].remaining == 300
+                && multiPackStat.packages[0].name == "会员积分"
+                && multiPackStat.packages[1].remaining == 10
+                && multiPackStat.packages[1].name == "兑换积分",
+            "Trae credit mapping carries the full package list with remaining totals"
+        )
+        try expect(
+            multiPackStat.packages[0].expireAt == Date(timeIntervalSince1970: 1_787_500_800.123),
+            "Trae package expiry handles millisecond timestamps"
+        )
+        try expect(
+            multiPackStat.packages[2].isUnlimited
+                && multiPackStat.packages[2].total == nil
+                && multiPackStat.packages[2].name == "不限量包",
+            "Trae unlimited packs map without a fake finite total"
+        )
+
+        // T-SR-01 + T-ISO-01：稳定排序与错误/成功共存（纯函数层）
+        let wbStat = AccountCreditStat.workBuddy(
+            accountID: "wb-user-1",
+            accountName: "WB",
+            isCurrent: true,
+            sourceUserID: "wb-user-1"
+        ).resolving(
+            totalRemaining: 200,
+            expiringSoonRemaining: 60,
+            soonestExpireAt: creditNow.addingTimeInterval(2 * 24 * 3600),
+            unit: .credits
+        )
+        let wbErrorStat = AccountCreditStat.failure(
+            provider: .workBuddy,
+            accountID: "wb-user-2",
+            accountName: "WB2",
+            isCurrent: false,
+            sourceUserID: "wb-user-2",
+            error: "登录已过期"
+        )
+        let sortedStats = CreditStatMapper.sort([
+            wbStat, wbErrorStat, traeCreditsStat, traeRequestStat
+        ])
+        try expect(
+            sortedStats.map(\.accountID)
+                == ["wb-user-1", "wb-user-2", "china:shared-fixture-user", "china:request-user"],
+            "credit cards sort WorkBuddy before Trae and preserve group order"
+        )
+        try expect(
+            sortedStats.first(where: { $0.accountID == "wb-user-2" })?.error == "登录已过期"
+                && sortedStats.first(where: { $0.accountID == "wb-user-1" })?.totalRemaining == 200,
+            "a failing account card coexists with healthy cards without corrupting them"
+        )
+
+        // T-SR-02：同 provider 内按「最近到期日」升序（最快到期在最上），无到期日次之，失败卡最后
+        let colWbFar = AccountCreditStat.workBuddy(
+            accountID: "wb-far",
+            accountName: "WB Far",
+            isCurrent: false,
+            sourceUserID: "wb-far"
+        ).resolving(
+            totalRemaining: 100,
+            expiringSoonRemaining: 0,
+            soonestExpireAt: creditNow.addingTimeInterval(10 * 24 * 3600),
+            unit: .credits
+        )
+        let colWbNoDate = AccountCreditStat.workBuddy(
+            accountID: "wb-nodate",
+            accountName: "WB NoDate",
+            isCurrent: false,
+            sourceUserID: "wb-nodate"
+        ).resolving(
+            totalRemaining: nil,
+            expiringSoonRemaining: 0,
+            soonestExpireAt: nil,
+            unit: .unlimited
+        )
+        let expirySortedStats = CreditStatMapper.sort([
+            colWbFar, wbErrorStat, colWbNoDate, wbStat
+        ])
+        try expect(
+            expirySortedStats.map(\.accountID)
+                == ["wb-user-1", "wb-far", "wb-nodate", "wb-user-2"],
+            "credit cards inside one provider sort by soonest expiry with dateless and failed cards last"
+        )
+        try expect(
+            CreditStatMapper.sort([traeRequestStat, wbStat]).map(\.provider)
+                == [.workBuddy, .traeCN],
+            "expiry ordering stays inside the provider grouping"
+        )
+
+        // T-COL-01：三列分组 —— 每个 app 一列，空 provider 不出现，列内沿用到期排序
+        let statColumns = CreditStatMapper.columns([
+            colWbFar, traeRequestStat, wbErrorStat, traeCreditsStat, wbStat, traeUnlimitedStat
+        ])
+        try expect(
+            statColumns.map(\.provider) == [.workBuddy, .traeCN, .traeWork],
+            "credit stats group into one column per app in provider order"
+        )
+        try expect(
+            statColumns[0].stats.map(\.accountID) == ["wb-user-1", "wb-far", "wb-user-2"]
+                && statColumns[1].stats.map(\.accountID)
+                    == ["china:shared-fixture-user", "china:request-user"]
+                && statColumns[2].stats.map(\.accountID) == ["work:unlimited-user"],
+            "each app column keeps its own soonest-expiry ordering"
+        )
+        try expect(
+            CreditStatMapper.columns([wbStat]).count == 1
+                && CreditStatMapper.columns([wbStat])[0].provider == .workBuddy,
+            "apps without any card produce no empty column"
+        )
+
+        // T-SR-03：排序键优先取卡片里最早的有效包到期日（Trae 的「下次结算日」只作回落）
+        let earlyPackStat = AccountCreditStat.workBuddy(
+            accountID: "trae-like-early-pack",
+            accountName: "EarlyPack",
+            isCurrent: false,
+            sourceUserID: "trae-like-early-pack"
+        ).resolving(
+            totalRemaining: 500,
+            expiringSoonRemaining: 0,
+            soonestExpireAt: creditNow.addingTimeInterval(10 * 24 * 3600),
+            unit: .credits,
+            packages: [
+                CreditPackage(
+                    name: "daily",
+                    total: 100,
+                    remaining: 60,
+                    used: 40,
+                    expireAt: creditNow.addingTimeInterval(1 * 24 * 3600),
+                    expired: false,
+                    expiringSoon: true
+                )
+            ]
+        )
+        let settlementOnlyStat = AccountCreditStat.workBuddy(
+            accountID: "trae-like-settlement",
+            accountName: "Settlement",
+            isCurrent: false,
+            sourceUserID: "trae-like-settlement"
+        ).resolving(
+            totalRemaining: 500,
+            expiringSoonRemaining: 0,
+            soonestExpireAt: creditNow.addingTimeInterval(2 * 24 * 3600),
+            unit: .credits
+        )
+        try expect(
+            CreditStatMapper.sort([settlementOnlyStat, earlyPackStat]).map(\.accountID)
+                == ["trae-like-early-pack", "trae-like-settlement"],
+            "a card with an earlier package expiry outranks a card with only a settlement date"
+        )
+        try expect(
+            CreditStatMapper.orderingExpiry(earlyPackStat)
+                == creditNow.addingTimeInterval(1 * 24 * 3600)
+                && CreditStatMapper.orderingExpiry(settlementOnlyStat)
+                    == creditNow.addingTimeInterval(2 * 24 * 3600),
+            "ordering expiry prefers the earliest live package date and falls back to settlement"
+        )
+        let deadPackOnlyStat = AccountCreditStat.workBuddy(
+            accountID: "trae-like-dead-pack",
+            accountName: "DeadPack",
+            isCurrent: false,
+            sourceUserID: "trae-like-dead-pack"
+        ).resolving(
+            totalRemaining: 0,
+            expiringSoonRemaining: 0,
+            soonestExpireAt: creditNow.addingTimeInterval(3 * 24 * 3600),
+            unit: .credits,
+            packages: [
+                CreditPackage(
+                    name: "expired",
+                    total: 100,
+                    remaining: 0,
+                    used: 100,
+                    expireAt: creditNow.addingTimeInterval(-1 * 24 * 3600),
+                    expired: true,
+                    expiringSoon: false
+                )
+            ]
+        )
+        try expect(
+            CreditStatMapper.orderingExpiry(deadPackOnlyStat)
+                == creditNow.addingTimeInterval(3 * 24 * 3600),
+            "expired or used-up packages do not become the ordering key"
+        )
+
+        // T-PKG-03：卡片内积分包列表按到期从近到远（有效包 → 已失效 → 无到期日）
+        let pkgNear = CreditPackage(
+            name: "near",
+            total: 100,
+            remaining: 90,
+            used: 10,
+            expireAt: creditNow.addingTimeInterval(1 * 24 * 3600),
+            expired: false,
+            expiringSoon: true
+        )
+        let pkgFar = CreditPackage(
+            name: "far",
+            total: 100,
+            remaining: 90,
+            used: 10,
+            expireAt: creditNow.addingTimeInterval(20 * 24 * 3600),
+            expired: false,
+            expiringSoon: false
+        )
+        let pkgExpired = CreditPackage(
+            name: "expired",
+            total: 100,
+            remaining: 40,
+            used: 60,
+            expireAt: creditNow.addingTimeInterval(-2 * 24 * 3600),
+            expired: true,
+            expiringSoon: false
+        )
+        let pkgUsedUp = CreditPackage(
+            name: "used-up",
+            total: 100,
+            remaining: 0,
+            used: 100,
+            expireAt: creditNow.addingTimeInterval(5 * 24 * 3600),
+            expired: false,
+            expiringSoon: false
+        )
+        let pkgNoDate = CreditPackage(
+            name: "no-date",
+            total: nil,
+            remaining: 50,
+            used: 0,
+            expireAt: nil,
+            expired: false,
+            expiringSoon: false
+        )
+        try expect(
+            CreditPackageOrdering.sorted([pkgFar, pkgNoDate, pkgUsedUp, pkgNear, pkgExpired])
+                .map(\.name) == ["near", "far", "expired", "used-up", "no-date"],
+            "package lists lead with the soonest expiry then dead packages then dateless ones"
+        )
+        try expect(
+            CreditPackageOrdering.sorted([pkgFar, pkgNoDate, pkgUsedUp, pkgNear, pkgExpired])
+                .filter { $0.remaining > 0 && !$0.expired && $0.expireAt != nil }
+                .map(\.name) == ["near", "far"],
+            "the near-expiry preview is the front slice of the same ordering"
+        )
+
+        // MARK: - 概览页积分统计：服务层隔离（Phase 2）
+
+        let isoNow = Date(timeIntervalSince1970: 1_750_000_000)
+        let wbGoodAccount = Data(
+            """
+            {
+              "account": { "uid": "wb-good", "nickname": "WB Good" },
+              "auth": { "accessToken": "wb-good-token" }
+            }
+            """.utf8
+        )
+        let wbBadAccount = Data(
+            """
+            {
+              "account": { "uid": "wb-bad", "nickname": "WB Bad" },
+              "auth": { "accessToken": "wb-bad-token" }
+            }
+            """.utf8
+        )
+        func billingPayload(_ remaining: Double, daysOut: Int) -> Data {
+            let object: [String: Any] = [
+                "code": 0,
+                "data": [
+                    "Accounts": [
+                        [
+                            "PackageName": "基础包",
+                            "CycleCapacityRemainPrecise": String(remaining),
+                            "DeductionEndTime": String(
+                                Int(isoNow.timeIntervalSince1970) + daysOut * 24 * 3600
+                            )
+                        ]
+                    ]
+                ]
+            ]
+            let data = try! JSONSerialization.data(withJSONObject: object)
+            return data
+        }
+
+        // T-ISO-01（主体）：两个 WorkBuddy 账号中一个过期 → 仅其卡片失败
+        let wbCreditClient = FixtureCreditStatsHTTPClient(
+            byBearerToken: [
+                "wb-good-token": FixtureTraeHTTPResponse(
+                    data: billingPayload(120, daysOut: 2)
+                ),
+                "wb-bad-token": FixtureTraeHTTPResponse(
+                    data: Data(),
+                    statusCode: 401
+                )
+            ]
+        )
+        let wbIsoService = CreditStatsService(
+            httpClient: wbCreditClient
+        )
+        let wbIsoStats = await wbIsoService.refresh(
+            workBuddy: [
+                WorkBuddyCreditAccount(
+                    userID: "wb-good",
+                    accountID: "wb-good",
+                    accountName: "WB Good",
+                    isCurrent: true,
+                    authData: wbGoodAccount
+                ),
+                WorkBuddyCreditAccount(
+                    userID: "wb-bad",
+                    accountID: "wb-bad",
+                    accountName: "WB Bad",
+                    isCurrent: false,
+                    authData: wbBadAccount
+                )
+            ],
+            trae: [],
+            now: isoNow
+        )
+        let wbGoodStat = wbIsoStats.first { $0.accountID == "wb-good" }
+        let wbBadStat = wbIsoStats.first { $0.accountID == "wb-bad" }
+        try expect(
+            wbGoodStat?.totalRemaining == 120
+                && wbGoodStat?.unit == .credits
+                && wbGoodStat?.expiringSoonRemaining == 120
+                && wbGoodStat?.error == nil
+                && wbGoodStat?.isCurrent == true,
+            "a healthy WorkBuddy credit card carries its total and near-expiry credits"
+        )
+        try expect(
+            wbBadStat?.totalRemaining == nil
+                && wbBadStat?.error == "登录已过期，请刷新登录后重试",
+            "an expired WorkBuddy account degrades to an inline error card only"
+        )
+
+        // T-ISO-01b（M-01）：凭据身份错绑 → 错误卡，且不发任何请求
+        let wbMismatchClient = FixtureCreditStatsHTTPClient(
+            byBearerToken: [
+                "wb-good-token": FixtureTraeHTTPResponse(
+                    data: billingPayload(120, daysOut: 2)
+                )
+            ]
+        )
+        let wbMismatchStats = await CreditStatsService(
+            httpClient: wbMismatchClient
+        ).refresh(
+            workBuddy: [
+                WorkBuddyCreditAccount(
+                    userID: "wb-good",
+                    accountID: "wb-good",
+                    accountName: "WB Good",
+                    isCurrent: true,
+                    authData: wbGoodAccount
+                ),
+                WorkBuddyCreditAccount(
+                    userID: "expected-other-user",
+                    accountID: "expected-other-user",
+                    accountName: "WB Mismatch",
+                    isCurrent: false,
+                    authData: wbGoodAccount
+                )
+            ],
+            trae: [],
+            now: isoNow
+        )
+        let mismatchStat = wbMismatchStats.first {
+            $0.accountID == "expected-other-user"
+        }
+        try expect(
+            mismatchStat?.error == "凭据身份与账号不匹配，请重新登录并保存"
+                && mismatchStat?.totalRemaining == nil,
+            "a WorkBuddy credential bound to a different account degrades its own card"
+        )
+        let mismatchRequestCount = await wbMismatchClient.capturedRequestCount()
+        try expect(
+            mismatchRequestCount == 1,
+            "identity-mismatched WorkBuddy account never sends a request"
+        )
+
+        // T-ISO-01c（H-03）：存在 Accounts 但无任何容量字段 → 整卡失败，不展示伪造的 0
+        let wbUnrecognizedClient = FixtureCreditStatsHTTPClient(
+            byBearerToken: [
+                "wb-good-token": FixtureTraeHTTPResponse(
+                    data: try JSONSerialization.data(
+                        withJSONObject: [
+                            "code": 0,
+                            "data": [
+                                "Accounts": [["PackageName": "unknown-shape"]]
+                            ]
+                        ]
+                    )
+                )
+            ]
+        )
+        let wbUnrecognizedStats = await CreditStatsService(
+            httpClient: wbUnrecognizedClient
+        ).refresh(
+            workBuddy: [
+                WorkBuddyCreditAccount(
+                    userID: "wb-good",
+                    accountID: "wb-good",
+                    accountName: "WB Good",
+                    isCurrent: true,
+                    authData: wbGoodAccount
+                )
+            ],
+            trae: [],
+            now: isoNow
+        )
+        try expect(
+            wbUnrecognizedStats.first?.error == "积分查询失败"
+                && wbUnrecognizedStats.first?.totalRemaining == nil,
+            "an unrecognized credit response fails the card instead of faking zero"
+        )
+
+        // T-ISO-01e（H-03）：空 Accounts 是合法成功 → 0 积分卡，而非失败
+        let wbEmptyClient = FixtureCreditStatsHTTPClient(
+            byBearerToken: [
+                "wb-good-token": FixtureTraeHTTPResponse(
+                    data: try JSONSerialization.data(
+                        withJSONObject: [
+                            "code": 0,
+                            "data": ["Accounts": []]
+                        ]
+                    )
+                )
+            ]
+        )
+        let wbEmptyStats = await CreditStatsService(
+            httpClient: wbEmptyClient
+        ).refresh(
+            workBuddy: [
+                WorkBuddyCreditAccount(
+                    userID: "wb-good",
+                    accountID: "wb-good",
+                    accountName: "WB Good",
+                    isCurrent: true,
+                    authData: wbGoodAccount
+                )
+            ],
+            trae: [],
+            now: isoNow
+        )
+        try expect(
+            wbEmptyStats.first?.totalRemaining == 0
+                && wbEmptyStats.first?.expiringSoonRemaining == 0
+                && wbEmptyStats.first?.error == nil,
+            "an empty Accounts array is a valid success with zero credits"
+        )
+
+        // T-ISO-01d（H-01）：非官方主机端点被 fail-closed，直接转错误卡
+        let wbUnsafeStats = await CreditStatsService(
+            httpClient: wbCreditClient,
+            workBuddyEndpoint: URL(string: "https://attacker.example/billing")!
+        ).refresh(
+            workBuddy: [
+                WorkBuddyCreditAccount(
+                    userID: "wb-good",
+                    accountID: "wb-good",
+                    accountName: "WB Good",
+                    isCurrent: true,
+                    authData: wbGoodAccount
+                )
+            ],
+            trae: [],
+            now: isoNow
+        )
+        try expect(
+            wbUnsafeStats.first?.error == "积分服务地址不受信任，已停止请求"
+                && wbUnsafeStats.first?.totalRemaining == nil,
+            "an unapproved credit endpoint is rejected before any fetch runs"
+        )
+
+        // T-ISO-01（Trae 侧）：单账号 401 → 登录过期卡片；单账号成功 → 正常卡片
+        let isoTraeDirectory = directory.appendingPathComponent(
+            "credit-stats-temp",
+            isDirectory: true
+        )
+        let isoTraeGoodAuth = try fixtureTraeAuth(
+            userID: "t-good",
+            token: "t-good-token",
+            host: "api.trae.cn",
+            displayName: "T Good",
+            keyByte: 41
+        )
+        let isoTraeGoodSnapshot = TraeCredentialSnapshot(
+            variant: .china,
+            userID: "t-good",
+            authBlob: isoTraeGoodAuth.blob,
+            userTagBlob: nil,
+            deviceAuthBlobs: [:],
+            capturedAt: isoNow
+        )
+        let isoTraeGoodClient = FixtureTraeHTTPClient(
+            pathResponses: [
+                "quota": [
+                    FixtureTraeHTTPResponse(data: traeQuotaData)
+                ]
+            ]
+        )
+        let isoTraeGoodService = TraeUsageService(
+            client: isoTraeGoodClient,
+            storageURL: { _ in isoTraeDirectory },
+            authRetryDelayNanoseconds: 0
+        )
+        let isoTraeGoodStats = await CreditStatsService(
+            traeUsageService: isoTraeGoodService
+        ).refresh(
+            workBuddy: [],
+            trae: [
+                TraeCreditAccount(
+                    variant: .china,
+                    profileID: "china:t-good",
+                    userID: "t-good",
+                    accountName: "T Good",
+                    isCurrent: false,
+                    snapshot: isoTraeGoodSnapshot
+                )
+            ],
+            now: isoNow
+        )
+        let tGoodStat = isoTraeGoodStats.first { $0.accountID == "china:t-good" }
+        try expect(
+            tGoodStat?.provider == .traeCN
+                && tGoodStat?.error == nil
+                && tGoodStat?.totalRemaining == nil
+                && tGoodStat?.unit == .unlimited,
+            "a healthy Trae credit card reflects the parsed quota"
+        )
+
+        let isoTraeBadAuth = try fixtureTraeAuth(
+            userID: "t-bad",
+            token: "t-bad-token",
+            host: "api.trae.cn",
+            displayName: "T Bad",
+            keyByte: 42
+        )
+        let isoTraeBadSnapshot = TraeCredentialSnapshot(
+            variant: .china,
+            userID: "t-bad",
+            authBlob: isoTraeBadAuth.blob,
+            userTagBlob: nil,
+            deviceAuthBlobs: [:],
+            capturedAt: isoNow
+        )
+        let isoTraeBadClient = FixtureTraeHTTPClient(
+            responses: [
+                FixtureTraeHTTPResponse(data: Data(), statusCode: 401),
+                FixtureTraeHTTPResponse(data: Data(), statusCode: 401)
+            ]
+        )
+        let isoTraeBadService = TraeUsageService(
+            client: isoTraeBadClient,
+            storageURL: { _ in isoTraeDirectory },
+            authRetryDelayNanoseconds: 0,
+            maxAuthRetries: 1
+        )
+        let isoTraeBadStats = await CreditStatsService(
+            traeUsageService: isoTraeBadService
+        ).refresh(
+            workBuddy: [],
+            trae: [
+                TraeCreditAccount(
+                    variant: .china,
+                    profileID: "china:t-bad",
+                    userID: "t-bad",
+                    accountName: "T Bad",
+                    isCurrent: false,
+                    snapshot: isoTraeBadSnapshot
+                )
+            ],
+            now: isoNow
+        )
+        let tBadStat = isoTraeBadStats.first { $0.accountID == "china:t-bad" }
+        try expect(
+            tBadStat?.error == "登录已过期，请刷新登录后重试"
+                && tBadStat?.totalRemaining == nil,
+            "an expired Trae account degrades to an inline error card"
+        )
+
+        // T-KC-04：Trae 批量读取（loadAll）按 keychainAccount 映射，单次调用覆盖全部账号
+        let traeBulkVault = FixtureTraeVault()
+        for (userID, variant) in [
+            ("bulk-cn-1", TraeVariant.china),
+            ("bulk-cn-2", TraeVariant.china),
+            ("bulk-wk-1", TraeVariant.work)
+        ] {
+            let auth = try fixtureTraeAuth(
+                userID: userID,
+                token: "bulk-token",
+                host: variant == .china ? "api.trae.cn" : "grow-normal.trae.ai",
+                displayName: userID,
+                keyByte: UInt8(userID.count % 251 + 1)
+            )
+            _ = try traeBulkVault.insertIfAbsent(
+                TraeCredentialSnapshot(
+                    variant: variant,
+                    userID: userID,
+                    authBlob: auth.blob,
+                    userTagBlob: nil,
+                    deviceAuthBlobs: [:],
+                    capturedAt: isoNow
+                )
+            )
+        }
+        let loadedAll = try traeBulkVault.loadAll()
+        try expect(
+            loadedAll.count == 3
+                && Set(loadedAll.keys) == [
+                    "china:bulk-cn-1",
+                    "china:bulk-cn-2",
+                    "work:bulk-wk-1"
+                ]
+                && loadedAll["work:bulk-wk-1"]?.variant == .work,
+            "Trae bulk vault read maps every account by its keychain account key"
+        )
+
+        // T-KC-05：loadAll 映射的身份一致性防线——kSecAttrAccount 与快照身份不符的项必须丢弃
+        let kcSnapshotEncoder = JSONEncoder()
+        kcSnapshotEncoder.dateEncodingStrategy = .iso8601
+        let kcSnapshotDecoder = JSONDecoder()
+        kcSnapshotDecoder.dateDecodingStrategy = .iso8601
+        let goodBulkAuth = try fixtureTraeAuth(
+            userID: "bulk-cn-1",
+            token: "bulk-good",
+            host: "api.trae.cn",
+            displayName: "Bulk Good",
+            keyByte: 61
+        )
+        let goodBulkSnapshot = TraeCredentialSnapshot(
+            variant: .china,
+            userID: "bulk-cn-1",
+            authBlob: goodBulkAuth.blob,
+            userTagBlob: nil,
+            deviceAuthBlobs: [:],
+            capturedAt: isoNow
+        )
+        let mismatchedBulkSnapshot = TraeCredentialSnapshot(
+            variant: .work,
+            userID: "other-user",
+            authBlob: goodBulkAuth.blob,
+            userTagBlob: nil,
+            deviceAuthBlobs: [:],
+            capturedAt: isoNow
+        )
+        let bulkItems: [[String: Any]] = [
+            [
+                kSecAttrAccount as String: "china:bulk-cn-1",
+                kSecValueData as String: try kcSnapshotEncoder.encode(mismatchedBulkSnapshot)
+            ],
+            [
+                kSecAttrAccount as String: "china:bulk-cn-1",
+                kSecValueData as String: try kcSnapshotEncoder.encode(goodBulkSnapshot)
+            ]
+        ]
+        let bulkMapped = TraeCredentialVault.mapLoaded(
+            bulkItems,
+            decoder: kcSnapshotDecoder
+        )
+        try expect(
+            bulkMapped.count == 1
+                && bulkMapped["china:bulk-cn-1"]?.userID == "bulk-cn-1"
+                && bulkMapped["china:bulk-cn-1"]?.variant == .china,
+            "Trae bulk load drops items whose stored identity does not match the keychain account"
+        )
+
         print("OpenUsage self-test passed: \(assertions) assertions")
     }
 }
@@ -3190,6 +4442,44 @@ private actor FixtureTraeHTTPClient: TraeHTTPClient {
 
     func requestCount() -> Int {
         requests.count
+    }
+}
+
+private actor FixtureCreditStatsHTTPClient: CreditStatsHTTPClient {
+    private let byBearerToken: [String: FixtureTraeHTTPResponse]
+    private var requestCount = 0
+
+    init(byBearerToken: [String: FixtureTraeHTTPResponse]) {
+        self.byBearerToken = byBearerToken
+    }
+
+    func data(
+        for request: URLRequest
+    ) async throws -> (Data, HTTPURLResponse) {
+        requestCount += 1
+        let authorization = request.allHTTPHeaderFields?["Authorization"] ?? ""
+        let token = authorization.hasPrefix("Bearer ")
+            ? String(authorization.dropFirst("Bearer ".count))
+            : authorization
+        guard let fixture = byBearerToken[token] else {
+            throw FixtureTraeHTTPError.missingResponse
+        }
+        guard
+            let responseURL = fixture.responseURL ?? request.url,
+            let response = HTTPURLResponse(
+                url: responseURL,
+                statusCode: fixture.statusCode,
+                httpVersion: nil,
+                headerFields: nil
+            )
+        else {
+            throw FixtureTraeHTTPError.invalidResponse
+        }
+        return (fixture.data, response)
+    }
+
+    func capturedRequestCount() -> Int {
+        requestCount
     }
 }
 
@@ -3299,6 +4589,8 @@ private func fixtureTraeStorage(
 private final class FixtureTraeVault: TraeCredentialVaulting, @unchecked Sendable {
     private(set) var snapshots: [String: TraeCredentialSnapshot] = [:]
     private(set) var savedAccounts = Set<String>()
+    private(set) var loadAllCalls = 0
+    private(set) var loadCalls = 0
 
     func save(_ snapshot: TraeCredentialSnapshot) throws {
         snapshots[snapshot.keychainAccount] = snapshot
@@ -3309,6 +4601,7 @@ private final class FixtureTraeVault: TraeCredentialVaulting, @unchecked Sendabl
         variant: TraeVariant,
         userID: String
     ) throws -> TraeCredentialSnapshot {
+        loadCalls += 1
         guard let snapshot = snapshots["\(variant.rawValue):\(userID)"] else {
             throw TraeSupportError.accountSnapshotMissing
         }
@@ -3317,6 +4610,11 @@ private final class FixtureTraeVault: TraeCredentialVaulting, @unchecked Sendabl
 
     func probeExistence(variant: TraeVariant, userID: String) throws -> Bool {
         snapshots["\(variant.rawValue):\(userID)"] != nil
+    }
+
+    func loadAll() throws -> [String: TraeCredentialSnapshot] {
+        loadAllCalls += 1
+        return snapshots
     }
 
     func insertIfAbsent(_ snapshot: TraeCredentialSnapshot) throws -> Bool {
